@@ -496,6 +496,91 @@ impl eframe::App for FloatApp {
 
 // ─── 主入口 ──────────────────────────────────────────────
 
+struct LogManager {
+    file: Option<std::fs::File>,
+    last_text: Option<String>,
+    last_header_pos: u64,
+    start_time: Option<chrono::DateTime<chrono::Local>>,
+}
+
+impl LogManager {
+    fn new() -> Self {
+        use std::fs::OpenOptions;
+        use std::io::Seek;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open("ocr_log.txt")
+            .ok();
+        
+        let mut mgr = Self {
+            file,
+            last_text: None,
+            last_header_pos: 0,
+            start_time: None,
+        };
+
+        if let Some(ref mut f) = mgr.file {
+            let _ = f.seek(std::io::SeekFrom::End(0));
+        }
+        mgr
+    }
+
+    fn reset(&mut self) {
+        self.last_text = None;
+        self.last_header_pos = 0;
+        self.start_time = None;
+    }
+
+    fn log(&mut self, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+
+        let file = match &mut self.file {
+            Some(f) => f,
+            None => return,
+        };
+
+        use std::io::{Write, Seek, SeekFrom};
+        let now = chrono::Local::now();
+        let time_str = now.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+
+        if let Some(ref last) = self.last_text {
+            if last == text {
+                // 如果结果与之前一样，则定位到上一条记录的头部，覆写结束时间
+                if file.seek(SeekFrom::Start(self.last_header_pos)).is_ok() {
+                    let start_str = self.start_time.unwrap().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+                    // 覆写时间头部，格式和长度必须保持完全一致以避免文本发生位移 (包括毫秒在内恰好 60 字节)
+                    let header = format!("=== [{} ~ {}] ===\r\n", start_str, time_str);
+                    let _ = file.write_all(header.as_bytes());
+                    let _ = file.flush();
+                }
+                return;
+            }
+        }
+
+        // 如果结果不同或为新会话，则在文件末尾写入新片段
+        let _ = file.seek(SeekFrom::End(0));
+        if let Ok(pos) = file.stream_position() {
+            self.last_header_pos = pos;
+        } else {
+            self.last_header_pos = 0;
+        }
+
+        self.last_text = Some(text.to_string());
+        self.start_time = Some(now);
+
+        let header = format!("=== [{} ~ {}] ===\r\n", time_str, time_str);
+        let _ = file.write_all(header.as_bytes());
+        let _ = file.write_all(text.as_bytes());
+        let _ = file.write_all(b"\r\n\r\n");
+        let _ = file.flush();
+    }
+}
+
 fn main() -> Result<()> {
     // 1. 初始化跨线程共享的状态
     let shared_text = Arc::new(Mutex::new(String::from("等待选择区域...")));
@@ -551,10 +636,12 @@ fn main() -> Result<()> {
 
             std::thread::spawn(move || {
                 let mut history = std::collections::VecDeque::with_capacity(10);
+                let mut log_mgr = LogManager::new();
                 loop {
                     let is_paused = *paused_for_thread.lock().unwrap();
                     if is_paused {
                         history.clear();
+                        log_mgr.reset();
                         std::thread::sleep(std::time::Duration::from_millis(200));
                         continue;
                     }
@@ -565,6 +652,8 @@ fn main() -> Result<()> {
                         match ocr_region(x, y, w, h) {
                             Ok(text) => {
                                 let ms = start.elapsed().as_millis();
+                                
+                                log_mgr.log(&text);
                                 *text_for_thread.lock().unwrap() = text;
                                 *elapsed_for_thread.lock().unwrap() = ms;
 
