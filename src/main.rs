@@ -11,7 +11,261 @@ use windows::{
     core::{HSTRING, Interface},
 };
 
-fn ocr_region(x: i32, y: i32, width: u32, height: u32) -> Result<String> {
+fn binarize_bgra(bgra: &mut [u8]) {
+    let pixel_count = bgra.len() / 4;
+    if pixel_count == 0 {
+        return;
+    }
+
+    // 1. 计算灰度值并生成直方图
+    let mut grays = Vec::with_capacity(pixel_count);
+    let mut histogram = [0u32; 256];
+    for chunk in bgra.chunks_exact(4) {
+        let b = chunk[0] as u32;
+        let g = chunk[1] as u32;
+        let r = chunk[2] as u32;
+        // 使用标准心理学权重计算灰度
+        let gray_val = ((r * 299 + g * 587 + b * 114) / 1000) as u8;
+        grays.push(gray_val);
+        histogram[gray_val as usize] += 1;
+    }
+
+    // 2. 使用大津法 (Otsu's method) 计算最佳二值化阈值
+    let mut sum = 0.0;
+    for (i, &count) in histogram.iter().enumerate() {
+        sum += i as f32 * count as f32;
+    }
+
+    let mut sum_b = 0.0;
+    let mut w_b = 0u32;
+    let mut var_max = 0.0;
+    let mut threshold = 127u8;
+
+    for t in 0..256 {
+        w_b += histogram[t];
+        if w_b == 0 {
+            continue;
+        }
+
+        let w_f = pixel_count as u32 - w_b;
+        if w_f == 0 {
+            break;
+        }
+
+        sum_b += t as f32 * histogram[t] as f32;
+
+        let m_b = sum_b / w_b as f32;
+        let m_f = (sum - sum_b) / w_f as f32;
+
+        let var_between = w_b as f32 * w_f as f32 * (m_b - m_f) * (m_b - m_f);
+
+        if var_between > var_max {
+            var_max = var_between;
+            threshold = t as u8;
+        }
+    }
+
+    // 3. 统计暗色像素占比，判断是否为深色背景以进行智能反色
+    // (如果暗色像素占比过半，说明是深色背景，此时需要反色：原深色转白色，原亮色文本转黑色)
+    let dark_pixels = grays.iter().filter(|&&g| g < threshold).count();
+    let invert = dark_pixels > pixel_count / 2;
+
+    // 4. 应用二值化
+    for (i, chunk) in bgra.chunks_exact_mut(4).enumerate() {
+        let g = grays[i];
+        let val = if invert {
+            if g < threshold { 255 } else { 0 }
+        } else {
+            if g < threshold { 0 } else { 255 }
+        };
+        chunk[0] = val; // B
+        chunk[1] = val; // G
+        chunk[2] = val; // R
+        chunk[3] = 255; // A (不透明)
+    }
+}
+
+
+fn save_temp_png(bgra: &[u8], width: u32, height: u32) -> Result<std::path::PathBuf> {
+    let temp_dir = std::env::temp_dir();
+    let temp_img_path = temp_dir.join("miaocr_temp.png");
+
+    let rgba_bytes: Vec<u8> = bgra.chunks_exact(4)
+        .flat_map(|p| [p[2], p[1], p[0], p[3]])
+        .collect();
+
+    let img_buffer = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(
+        width,
+        height,
+        rgba_bytes,
+    )
+    .ok_or_else(|| anyhow::anyhow!("Failed to convert image buffer for saving"))?;
+
+    img_buffer.save(&temp_img_path)?;
+    Ok(temp_img_path)
+}
+
+fn ocr_tesseract(bgra: &[u8], width: u32, height: u32) -> Result<String> {
+    let temp_path = save_temp_png(bgra, width, height)?;
+    let output = std::process::Command::new("tesseract")
+        .arg(temp_path.to_str().unwrap())
+        .arg("stdout")
+        .arg("-l")
+        .arg("chi_sim")
+        .output();
+
+    let _ = std::fs::remove_file(temp_path);
+
+    match output {
+        Ok(out) => {
+            if out.status.success() {
+                let text = String::from_utf8_lossy(&out.stdout).to_string();
+                Ok(text)
+            } else {
+                let err = String::from_utf8_lossy(&out.stderr).to_string();
+                Err(anyhow::anyhow!("Tesseract 运行出错: {}", err))
+            }
+        }
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Err(anyhow::anyhow!("未在系统 PATH 中找到 tesseract.exe\n请先安装 Tesseract OCR 并将其加入系统环境变量。"))
+            } else {
+                Err(anyhow::anyhow!("调用 Tesseract 失败: {}", e))
+            }
+        }
+    }
+}
+
+fn ocr_paddle(bgra: &[u8], width: u32, height: u32) -> Result<String> {
+    let temp_path = save_temp_png(bgra, width, height)?;
+    let output = std::process::Command::new("paddleocr")
+        .arg("--image_dir")
+        .arg(temp_path.to_str().unwrap())
+        .output();
+
+    let _ = std::fs::remove_file(temp_path);
+
+    match output {
+        Ok(out) => {
+            if out.status.success() {
+                let text = String::from_utf8_lossy(&out.stdout).to_string();
+                let mut lines = Vec::new();
+                for line in text.lines() {
+                    if let Some(start_idx) = line.find("('") {
+                        if let Some(end_idx) = line[start_idx + 2..].find("',") {
+                            let actual_text = &line[start_idx + 2..start_idx + 2 + end_idx];
+                            lines.push(actual_text.to_string());
+                        }
+                    }
+                }
+                if lines.is_empty() {
+                    Ok(text)
+                } else {
+                    Ok(lines.join("\n"))
+                }
+            } else {
+                let err = String::from_utf8_lossy(&out.stderr).to_string();
+                Err(anyhow::anyhow!("PaddleOCR 运行出错: {}", err))
+            }
+        }
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Err(anyhow::anyhow!("未在系统 PATH 中找到 paddleocr.exe\n请先通过 pip install paddleocr 安装，并确保在环境变量中。"))
+            } else {
+                Err(anyhow::anyhow!("调用 PaddleOCR 失败: {}", e))
+            }
+        }
+    }
+}
+
+fn ocr_easy(bgra: &[u8], width: u32, height: u32) -> Result<String> {
+    let temp_path = save_temp_png(bgra, width, height)?;
+    let output = std::process::Command::new("easyocr")
+        .arg("-l")
+        .arg("ch_sim")
+        .arg("-f")
+        .arg(temp_path.to_str().unwrap())
+        .output();
+
+    let _ = std::fs::remove_file(temp_path);
+
+    match output {
+        Ok(out) => {
+            if out.status.success() {
+                let text = String::from_utf8_lossy(&out.stdout).to_string();
+                let mut lines = Vec::new();
+                for line in text.lines() {
+                    if let Some(start_idx) = line.find(", '") {
+                        if let Some(end_idx) = line[start_idx + 3..].find("',") {
+                            let actual_text = &line[start_idx + 3..start_idx + 3 + end_idx];
+                            lines.push(actual_text.to_string());
+                        }
+                    } else if let Some(start_idx) = line.find(", \"") {
+                        if let Some(end_idx) = line[start_idx + 3..].find("\",") {
+                            let actual_text = &line[start_idx + 3..start_idx + 3 + end_idx];
+                            lines.push(actual_text.to_string());
+                        }
+                    }
+                }
+                if lines.is_empty() {
+                    Ok(text)
+                } else {
+                    Ok(lines.join("\n"))
+                }
+            } else {
+                let err = String::from_utf8_lossy(&out.stderr).to_string();
+                Err(anyhow::anyhow!("EasyOCR 运行出错: {}", err))
+            }
+        }
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Err(anyhow::anyhow!("未在系统 PATH 中找到 easyocr.exe\n请先通过 pip install easyocr 安装，并确保在环境变量中。"))
+            } else {
+                Err(anyhow::anyhow!("调用 EasyOCR 失败: {}", e))
+            }
+        }
+    }
+}
+
+fn ocr_api(bgra: &[u8], width: u32, height: u32, url: &str) -> Result<String> {
+    let temp_path = save_temp_png(bgra, width, height)?;
+    let output = std::process::Command::new("curl")
+        .arg("-s")
+        .arg("-F")
+        .arg(format!("image=@{}", temp_path.to_str().unwrap()))
+        .arg(url)
+        .output();
+
+    let _ = std::fs::remove_file(temp_path);
+
+    match output {
+        Ok(out) => {
+            if out.status.success() {
+                let text = String::from_utf8_lossy(&out.stdout).to_string();
+                Ok(text)
+            } else {
+                let err = String::from_utf8_lossy(&out.stderr).to_string();
+                Err(anyhow::anyhow!("API 服务器错误: {}", err))
+            }
+        }
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Err(anyhow::anyhow!("系统未找到 curl.exe，请确保您的 Windows 环境正常。"))
+            } else {
+                Err(anyhow::anyhow!("发送 API 请求失败: {}", e))
+            }
+        }
+    }
+}
+
+fn ocr_region(
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    backend: BackendType,
+    api_url: &str,
+) -> Result<String> {
     let screens = Screen::all()?;
     let center_x = x + (width as i32) / 2;
     let center_y = y + (height as i32) / 2;
@@ -43,8 +297,8 @@ fn ocr_region(x: i32, y: i32, width: u32, height: u32) -> Result<String> {
     let image = screen.capture_area(local_x, local_y, capture_width, capture_height)?;
     let raw: &[u8] = image.as_raw();
 
-    // Dynamic upscaling: only resize if the selection is small (e.g. under 400x300)
-    let (bgra, final_width, final_height) = if capture_width < 400 && capture_height < 300 {
+    // 动态缩放：对于小于 500x400 的中偏小选区，放大 2 倍以提升 OCR 解析精度
+    let (mut bgra, final_width, final_height) = if capture_width < 500 && capture_height < 400 {
         // Reconstruct ImageBuffer from raw RGBA bytes
         let img_buffer = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(
             capture_width,
@@ -81,49 +335,90 @@ fn ocr_region(x: i32, y: i32, width: u32, height: u32) -> Result<String> {
         (bgra_bytes, capture_width, capture_height)
     };
 
-    let bitmap = SoftwareBitmap::CreateWithAlpha(
-        BitmapPixelFormat::Bgra8,
-        final_width as i32,
-        final_height as i32,
-        BitmapAlphaMode::Premultiplied,
-    )?;
+    // 应用二值化与智能反色算法预处理图片，去除抗锯齿杂色并将背景归一化为纯白底黑字
+    binarize_bgra(&mut bgra);
 
-    let buf = Buffer::Create(bgra.len() as u32)?;
-    buf.SetLength(bgra.len() as u32)?;
-    unsafe {
-        let byte_access: IBufferByteAccess = buf.cast()?;
-        let data = std::slice::from_raw_parts_mut(byte_access.Buffer()?, bgra.len());
-        data.copy_from_slice(&bgra);
-    }
-    bitmap.CopyFromBuffer(&buf)?;
+    match backend {
+        BackendType::WindowsNative => {
+            let bitmap = SoftwareBitmap::CreateWithAlpha(
+                BitmapPixelFormat::Bgra8,
+                final_width as i32,
+                final_height as i32,
+                BitmapAlphaMode::Premultiplied,
+            )?;
 
-    let lang = Language::CreateLanguage(&HSTRING::from("zh-CN"))?;
-
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        if let Ok(supported) = OcrEngine::IsLanguageSupported(&lang) {
-            println!("Windows OCR 'zh-CN' 支持情况: {}", supported);
-        }
-        if let Ok(engine) = OcrEngine::TryCreateFromLanguage(&lang) {
-            if let Ok(rec_lang) = engine.RecognizerLanguage() {
-                if let Ok(tag) = rec_lang.LanguageTag() {
-                    println!("当前实际使用的 OCR 语言: {}", tag);
-                }
+            let buf = Buffer::Create(bgra.len() as u32)?;
+            buf.SetLength(bgra.len() as u32)?;
+            unsafe {
+                let byte_access: IBufferByteAccess = buf.cast()?;
+                let data = std::slice::from_raw_parts_mut(byte_access.Buffer()?, bgra.len());
+                data.copy_from_slice(&bgra);
             }
+            bitmap.CopyFromBuffer(&buf)?;
+
+            let lang = Language::CreateLanguage(&HSTRING::from("zh-CN"))?;
+
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                if let Ok(supported) = OcrEngine::IsLanguageSupported(&lang) {
+                    println!("Windows OCR 'zh-CN' 支持情况: {}", supported);
+                }
+                if let Ok(engine) = OcrEngine::TryCreateFromLanguage(&lang) {
+                    if let Ok(rec_lang) = engine.RecognizerLanguage() {
+                        if let Ok(tag) = rec_lang.LanguageTag() {
+                            println!("当前实际使用的 OCR 语言: {}", tag);
+                        }
+                    }
+                }
+            });
+
+            let engine = OcrEngine::TryCreateFromLanguage(&lang)?;
+            let result = engine.RecognizeAsync(&bitmap)?.get()?;
+            let text = result.Text()?.to_string();
+
+            let clean: String = text
+                .lines()
+                .map(|l: &str| l.replace(' ', ""))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            Ok(clean)
         }
-    });
-
-    let engine = OcrEngine::TryCreateFromLanguage(&lang)?;
-    let result = engine.RecognizeAsync(&bitmap)?.get()?;
-    let text = result.Text()?.to_string();
-
-    let clean: String = text
-        .lines()
-        .map(|l: &str| l.replace(' ', ""))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    Ok(clean)
+        BackendType::Tesseract => {
+            let text = ocr_tesseract(&bgra, final_width, final_height)?;
+            let clean: String = text
+                .lines()
+                .map(|l: &str| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(clean)
+        }
+        BackendType::PaddleOcr => {
+            let text = ocr_paddle(&bgra, final_width, final_height)?;
+            let clean: String = text
+                .lines()
+                .map(|l: &str| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(clean)
+        }
+        BackendType::EasyOcr => {
+            let text = ocr_easy(&bgra, final_width, final_height)?;
+            let clean: String = text
+                .lines()
+                .map(|l: &str| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(clean)
+        }
+        BackendType::CloudApi => {
+            let text = ocr_api(&bgra, final_width, final_height, api_url)?;
+            Ok(text)
+        }
+    }
 }
 
 fn get_cursor_pos() -> Option<(i32, i32)> {
@@ -140,6 +435,27 @@ fn get_cursor_pos() -> Option<(i32, i32)> {
 }
 
 // ─── 悬浮窗应用 ──────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackendType {
+    WindowsNative,
+    Tesseract,
+    PaddleOcr,
+    EasyOcr,
+    CloudApi,
+}
+
+impl BackendType {
+    fn display_name(&self) -> &'static str {
+        match self {
+            BackendType::WindowsNative => "Windows 原生",
+            BackendType::Tesseract => "Tesseract (本地)",
+            BackendType::PaddleOcr => "PaddleOCR (本地)",
+            BackendType::EasyOcr => "EasyOCR (本地)",
+            BackendType::CloudApi => "自定义 API",
+        }
+    }
+}
 
 #[derive(PartialEq)]
 enum AppMode {
@@ -168,6 +484,8 @@ struct FloatApp {
     text: Arc<Mutex<String>>,
     elapsed: Arc<Mutex<u128>>,
     interval: Arc<Mutex<u128>>,
+    selected_backend: Arc<Mutex<BackendType>>,
+    api_url: Arc<Mutex<String>>,
 
     // 折叠展开状态
     expanded: bool,
@@ -456,21 +774,49 @@ impl eframe::App for FloatApp {
                         if self.expanded {
                             ui.separator();
 
+                            // 引擎选择 + 耗时统计 + 复制 — 合并成单行，避免换行
                             ui.horizontal(|ui| {
-                                let ms = *self.elapsed.lock().unwrap();
-                                let interval = *self.interval.lock().unwrap();
-                                if ms > 0 {
-                                    ui.label(
-                                        egui::RichText::new(format!("耗时: {} ms | 间隔: {} ms", ms, interval))
-                                            .color(egui::Color32::GRAY)
-                                            .size(11.0),
-                                    );
+                                // 引擎选择器放在最左侧
+                                ui.label(egui::RichText::new("引擎:").size(11.0).color(egui::Color32::from_rgb(100, 200, 255)));
+                                let mut current_backend = *self.selected_backend.lock().unwrap();
+                                let prev_backend = current_backend;
+                                let combo = egui::ComboBox::from_id_source("backend_select")
+                                    .selected_text(current_backend.display_name())
+                                    .width(110.0);
+                                combo.show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut current_backend, BackendType::WindowsNative, "Windows 原生");
+                                    ui.selectable_value(&mut current_backend, BackendType::Tesseract, "Tesseract (本地)");
+                                    ui.selectable_value(&mut current_backend, BackendType::PaddleOcr, "PaddleOCR (本地)");
+                                    ui.selectable_value(&mut current_backend, BackendType::EasyOcr, "EasyOCR (本地)");
+                                    ui.selectable_value(&mut current_backend, BackendType::CloudApi, "自定义 API");
+                                });
+                                if current_backend != prev_backend {
+                                    *self.selected_backend.lock().unwrap() = current_backend;
                                 }
 
+                                // 如果选择了 CloudApi，紧随其后显示 URL 输入框
+                                if current_backend == BackendType::CloudApi {
+                                    let mut url = self.api_url.lock().unwrap().clone();
+                                    ui.label(egui::RichText::new("URL:").size(11.0).color(egui::Color32::from_rgb(100, 200, 255)));
+                                    if ui.add(egui::TextEdit::singleline(&mut url).desired_width(80.0)).changed() {
+                                        *self.api_url.lock().unwrap() = url;
+                                    }
+                                }
+
+                                // 耗时信息 + 复制按钮放右侧
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     let text = self.text.lock().unwrap().clone();
                                     if ui.button("复制").clicked() {
                                         ui.output_mut(|o| o.copied_text = text);
+                                    }
+                                    let ms = *self.elapsed.lock().unwrap();
+                                    let interval = *self.interval.lock().unwrap();
+                                    if ms > 0 {
+                                        ui.label(
+                                            egui::RichText::new(format!("耗时{}ms|间隔{}ms", ms, interval))
+                                                .color(egui::Color32::GRAY)
+                                                .size(10.0),
+                                        );
                                     }
                                 });
                             });
@@ -479,7 +825,7 @@ impl eframe::App for FloatApp {
 
                             let text = self.text.lock().unwrap().clone();
                             egui::ScrollArea::vertical()
-                                .max_height(160.0)
+                                .max_height(115.0)
                                 .show(ui, |ui| {
                                     ui.add(
                                         egui::TextEdit::multiline(&mut text.as_str())
@@ -588,6 +934,8 @@ fn main() -> Result<()> {
     let shared_interval = Arc::new(Mutex::new(1000u128));
     let shared_paused = Arc::new(Mutex::new(true));
     let shared_region = Arc::new(Mutex::new(None));
+    let shared_backend = Arc::new(Mutex::new(BackendType::WindowsNative));
+    let shared_api_url = Arc::new(Mutex::new(String::from("http://127.0.0.1:8000/ocr")));
 
     // 2. 设定无边框、始终置顶且支持透明背景的悬浮胶囊参数
     let options = eframe::NativeOptions {
@@ -605,6 +953,8 @@ fn main() -> Result<()> {
     let shared_interval_clone = shared_interval.clone();
     let shared_paused_clone = shared_paused.clone();
     let shared_region_clone = shared_region.clone();
+    let shared_backend_clone = shared_backend.clone();
+    let shared_api_url_clone = shared_api_url.clone();
 
     eframe::run_native(
         "miaocr",
@@ -633,6 +983,8 @@ fn main() -> Result<()> {
             let interval_for_thread = shared_interval_clone.clone();
             let paused_for_thread = shared_paused_clone.clone();
             let region_for_thread = shared_region_clone.clone();
+            let backend_for_thread = shared_backend_clone.clone();
+            let api_url_for_thread = shared_api_url_clone.clone();
 
             std::thread::spawn(move || {
                 let mut history = std::collections::VecDeque::with_capacity(10);
@@ -648,8 +1000,10 @@ fn main() -> Result<()> {
 
                     let opt_region = *region_for_thread.lock().unwrap();
                     if let Some((x, y, w, h)) = opt_region {
+                        let backend = *backend_for_thread.lock().unwrap();
+                        let url = api_url_for_thread.lock().unwrap().clone();
                         let start = std::time::Instant::now();
-                        match ocr_region(x, y, w, h) {
+                        match ocr_region(x, y, w, h, backend, &url) {
                             Ok(text) => {
                                 let ms = start.elapsed().as_millis();
                                 
@@ -694,6 +1048,8 @@ fn main() -> Result<()> {
                 text: shared_text,
                 elapsed: shared_elapsed,
                 interval: shared_interval,
+                selected_backend: shared_backend,
+                api_url: shared_api_url,
                 expanded: false,
                 screenshot_texture: None,
                 screenshot_raw: Vec::new(),
