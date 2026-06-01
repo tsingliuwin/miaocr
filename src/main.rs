@@ -43,35 +43,48 @@ fn ocr_region(x: i32, y: i32, width: u32, height: u32) -> Result<String> {
     let image = screen.capture_area(local_x, local_y, capture_width, capture_height)?;
     let raw: &[u8] = image.as_raw();
 
-    // Reconstruct ImageBuffer from raw RGBA bytes
-    let img_buffer = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(
-        capture_width,
-        capture_height,
-        raw.to_vec(),
-    )
-    .ok_or_else(|| anyhow::anyhow!("Failed to create image buffer"))?;
+    // Dynamic upscaling: only resize if the selection is small (e.g. under 400x300)
+    let (bgra, final_width, final_height) = if capture_width < 400 && capture_height < 300 {
+        // Reconstruct ImageBuffer from raw RGBA bytes
+        let img_buffer = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(
+            capture_width,
+            capture_height,
+            raw.to_vec(),
+        )
+        .ok_or_else(|| anyhow::anyhow!("Failed to create image buffer"))?;
 
-    // Scale up 2x using CatmullRom sharpening filter to improve OCR accuracy
-    let scaled_width = capture_width * 2;
-    let scaled_height = capture_height * 2;
-    let resized_img = image::imageops::resize(
-        &img_buffer,
-        scaled_width,
-        scaled_height,
-        image::imageops::FilterType::CatmullRom,
-    );
+        // Scale up 2x using CatmullRom sharpening filter to improve OCR accuracy
+        let scaled_width = capture_width * 2;
+        let scaled_height = capture_height * 2;
+        let resized_img = image::imageops::resize(
+            &img_buffer,
+            scaled_width,
+            scaled_height,
+            image::imageops::FilterType::CatmullRom,
+        );
 
-    // Convert RGBA to BGRA
-    let bgra: Vec<u8> = resized_img
-        .as_raw()
-        .chunks_exact(4)
-        .flat_map(|p| [p[2], p[1], p[0], p[3]])
-        .collect();
+        // Convert RGBA to BGRA
+        let bgra_bytes: Vec<u8> = resized_img
+            .as_raw()
+            .chunks_exact(4)
+            .flat_map(|p| [p[2], p[1], p[0], p[3]])
+            .collect();
+
+        (bgra_bytes, scaled_width, scaled_height)
+    } else {
+        // Convert RGBA to BGRA directly without resizing
+        let bgra_bytes: Vec<u8> = raw
+            .chunks_exact(4)
+            .flat_map(|p| [p[2], p[1], p[0], p[3]])
+            .collect();
+
+        (bgra_bytes, capture_width, capture_height)
+    };
 
     let bitmap = SoftwareBitmap::CreateWithAlpha(
         BitmapPixelFormat::Bgra8,
-        scaled_width as i32,
-        scaled_height as i32,
+        final_width as i32,
+        final_height as i32,
         BitmapAlphaMode::Premultiplied,
     )?;
 
