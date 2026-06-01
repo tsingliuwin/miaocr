@@ -4,6 +4,14 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+screenshots = "0.8"
+image = "0.24"
+anyhow = "1"
+eframe = { version = "0.27", features = ["default"] }
+egui = "0.27"
+chrono = "0.4"
+
+[target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = [
     "Graphics_Imaging",
     "Media_Ocr",
@@ -13,9 +21,6 @@ windows = { version = "0.58", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_Foundation",
 ] }
-screenshots = "0.8"
-image = "0.24"
-anyhow = "1"
-eframe = { version = "0.27", features = ["default"] }
-egui = "0.27"
-chrono = "0.4"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mouse_position = "0.1"

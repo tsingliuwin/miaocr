@@ -2,6 +2,7 @@ use anyhow::Result;
 use eframe::egui;
 use screenshots::Screen;
 use std::sync::{Arc, Mutex};
+#[cfg(target_os = "windows")]
 use windows::{
     Graphics::Imaging::{BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap},
     Globalization::Language,
@@ -446,6 +447,68 @@ fn ocr_api(bgra: &[u8], width: u32, height: u32, url: &str) -> Result<String> {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn ensure_macocr_binary() -> Result<std::path::PathBuf> {
+    let bin_path = app_dir().join("macocr_bin_v2");
+    if bin_path.exists() {
+        return Ok(bin_path);
+    }
+    
+    let swift_code = include_str!("mac_ocr.swift");
+    let swift_path = app_dir().join("mac_ocr.swift");
+    std::fs::write(&swift_path, swift_code)?;
+    
+    runtime_log("[SWIFT] 正在首次编译 macOS Vision OCR 辅助程序...");
+    let status = std::process::Command::new("swiftc")
+        .arg("-O")
+        .arg(swift_path.to_str().unwrap())
+        .arg("-o")
+        .arg(bin_path.to_str().unwrap())
+        .status();
+        
+    let _ = std::fs::remove_file(swift_path);
+    
+    match status {
+        Ok(s) if s.success() => {
+            runtime_log("[SWIFT] 辅助程序编译成功");
+            Ok(bin_path)
+        }
+        Ok(s) => Err(anyhow::anyhow!("Swift 编译器退出异常: {}", s)),
+        Err(e) => Err(anyhow::anyhow!("启动 Swift 编译器失败: {}", e)),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn ocr_mac_native(bgra: &[u8], width: u32, height: u32) -> Result<String> {
+    let bin_path = ensure_macocr_binary()?;
+    
+    use std::io::Write;
+    let mut child = std::process::Command::new(bin_path)
+        .arg(width.to_string())
+        .arg(height.to_string())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+        
+    {
+        let mut stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("无法打开子进程 stdin"))?;
+        stdin.write_all(bgra)?;
+        stdin.flush()?;
+    }
+    
+    let output = child.wait_with_output()?;
+    if output.status.success() {
+        let text = String::from_utf8_lossy(&output.stdout).to_string();
+        Ok(text)
+    } else {
+        let err = String::from_utf8_lossy(&output.stderr).to_string();
+        let out = String::from_utf8_lossy(&output.stdout).to_string();
+        let combined = if err.is_empty() { out } else if out.is_empty() { err } else { format!("{}\n{}", err, out) };
+        Err(anyhow::anyhow!("Vision OCR 运行出错: {}", combined.trim()))
+    }
+}
+
 fn ocr_region(
     x: i32,
     y: i32,
@@ -455,6 +518,9 @@ fn ocr_region(
     api_url: &str,
 ) -> Result<String> {
     let screens = Screen::all()?;
+    if screens.is_empty() {
+        return Err(anyhow::anyhow!("未检测到任何活动屏幕"));
+    }
     let center_x = x + (width as i32) / 2;
     let center_y = y + (height as i32) / 2;
 
@@ -489,15 +555,15 @@ fn ocr_region(
     let (mut bgra, final_width, final_height) = if capture_width < 500 && capture_height < 400 {
         // Reconstruct ImageBuffer from raw RGBA bytes
         let img_buffer = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(
-            capture_width,
-            capture_height,
+            image.width(),
+            image.height(),
             raw.to_vec(),
         )
         .ok_or_else(|| anyhow::anyhow!("Failed to create image buffer"))?;
 
         // Scale up 2x using CatmullRom sharpening filter to improve OCR accuracy
-        let scaled_width = capture_width * 2;
-        let scaled_height = capture_height * 2;
+        let scaled_width = image.width() * 2;
+        let scaled_height = image.height() * 2;
         let resized_img = image::imageops::resize(
             &img_buffer,
             scaled_width,
@@ -520,7 +586,7 @@ fn ocr_region(
             .flat_map(|p| [p[2], p[1], p[0], p[3]])
             .collect();
 
-        (bgra_bytes, capture_width, capture_height)
+        (bgra_bytes, image.width(), image.height())
     };
 
     // 应用二值化与智能反色算法预处理图片，去除抗锯齿杂色并将背景归一化为纯白底黑字
@@ -528,49 +594,73 @@ fn ocr_region(
 
     match backend {
         BackendType::WindowsNative => {
-            let bitmap = SoftwareBitmap::CreateWithAlpha(
-                BitmapPixelFormat::Bgra8,
-                final_width as i32,
-                final_height as i32,
-                BitmapAlphaMode::Premultiplied,
-            )?;
+            #[cfg(target_os = "windows")]
+            {
+                let bitmap = SoftwareBitmap::CreateWithAlpha(
+                    BitmapPixelFormat::Bgra8,
+                    final_width as i32,
+                    final_height as i32,
+                    BitmapAlphaMode::Premultiplied,
+                )?;
 
-            let buf = Buffer::Create(bgra.len() as u32)?;
-            buf.SetLength(bgra.len() as u32)?;
-            unsafe {
-                let byte_access: IBufferByteAccess = buf.cast()?;
-                let data = std::slice::from_raw_parts_mut(byte_access.Buffer()?, bgra.len());
-                data.copy_from_slice(&bgra);
-            }
-            bitmap.CopyFromBuffer(&buf)?;
-
-            let lang = Language::CreateLanguage(&HSTRING::from("zh-CN"))?;
-
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| {
-                if let Ok(supported) = OcrEngine::IsLanguageSupported(&lang) {
-                    println!("Windows OCR 'zh-CN' 支持情况: {}", supported);
+                let buf = Buffer::Create(bgra.len() as u32)?;
+                buf.SetLength(bgra.len() as u32)?;
+                unsafe {
+                    let byte_access: IBufferByteAccess = buf.cast()?;
+                    let data = std::slice::from_raw_parts_mut(byte_access.Buffer()?, bgra.len());
+                    data.copy_from_slice(&bgra);
                 }
-                if let Ok(engine) = OcrEngine::TryCreateFromLanguage(&lang) {
-                    if let Ok(rec_lang) = engine.RecognizerLanguage() {
-                        if let Ok(tag) = rec_lang.LanguageTag() {
-                            println!("当前实际使用的 OCR 语言: {}", tag);
+                bitmap.CopyFromBuffer(&buf)?;
+
+                let lang = Language::CreateLanguage(&HSTRING::from("zh-CN"))?;
+
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    if let Ok(supported) = OcrEngine::IsLanguageSupported(&lang) {
+                        println!("Windows OCR 'zh-CN' 支持情况: {}", supported);
+                    }
+                    if let Ok(engine) = OcrEngine::TryCreateFromLanguage(&lang) {
+                        if let Ok(rec_lang) = engine.RecognizerLanguage() {
+                            if let Ok(tag) = rec_lang.LanguageTag() {
+                                println!("当前实际使用的 OCR 语言: {}", tag);
+                            }
                         }
                     }
-                }
-            });
+                });
 
-            let engine = OcrEngine::TryCreateFromLanguage(&lang)?;
-            let result = engine.RecognizeAsync(&bitmap)?.get()?;
-            let text = result.Text()?.to_string();
+                let engine = OcrEngine::TryCreateFromLanguage(&lang)?;
+                let result = engine.RecognizeAsync(&bitmap)?.get()?;
+                let text = result.Text()?.to_string();
 
-            let clean: String = text
-                .lines()
-                .map(|l: &str| l.replace(' ', ""))
-                .collect::<Vec<_>>()
-                .join("\n");
+                let clean: String = text
+                    .lines()
+                    .map(|l: &str| l.replace(' ', ""))
+                    .collect::<Vec<_>>()
+                    .join("\n");
 
-            Ok(clean)
+                Ok(clean)
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                Err(anyhow::anyhow!("Windows 原生 OCR 仅支持 Windows 系统"))
+            }
+        }
+        BackendType::MacNative => {
+            #[cfg(target_os = "macos")]
+            {
+                let text = ocr_mac_native(&bgra, final_width, final_height)?;
+                let clean: String = text
+                    .lines()
+                    .map(|l: &str| l.trim().to_string())
+                    .filter(|l| !l.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Ok(clean)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Err(anyhow::anyhow!("macOS 原生 OCR 仅支持 macOS 系统"))
+            }
         }
         BackendType::Tesseract => {
             let text = ocr_tesseract(&bgra, final_width, final_height)?;
@@ -600,23 +690,40 @@ fn ocr_region(
 }
 
 fn get_cursor_pos() -> Option<(i32, i32)> {
-    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
-    use windows::Win32::Foundation::POINT;
-    unsafe {
-        let mut pt = POINT::default();
-        if GetCursorPos(&mut pt).is_ok() {
-            Some((pt.x, pt.y))
-        } else {
-            None
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+        use windows::Win32::Foundation::POINT;
+        unsafe {
+            let mut pt = POINT::default();
+            if GetCursorPos(&mut pt).is_ok() {
+                Some((pt.x, pt.y))
+            } else {
+                None
+            }
         }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use mouse_position::mouse_position::Mouse;
+        match Mouse::get_mouse_position() {
+            Mouse::Position { x, y } => Some((x, y)),
+            Mouse::Error => None,
+        }
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        None
     }
 }
 
 // ─── 悬浮窗应用 ──────────────────────────────────────────
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BackendType {
     WindowsNative,
+    MacNative,
     Tesseract,
     PaddleOcr,
     CloudApi,
@@ -626,6 +733,7 @@ impl BackendType {
     fn display_name(&self) -> &'static str {
         match self {
             BackendType::WindowsNative => "Windows 原生",
+            BackendType::MacNative     => "macOS 原生",
             BackendType::Tesseract    => "Tesseract (本地)",
             BackendType::PaddleOcr   => "PaddleOCR (本地)",
             BackendType::CloudApi    => "自定义 API",
@@ -646,6 +754,7 @@ struct ScreenInfo {
     y: i32,
     width: u32,
     height: u32,
+    #[allow(dead_code)]
     scale_factor: f32,
 }
 
@@ -715,8 +824,8 @@ impl eframe::App for FloatApp {
 
                     if let Ok(image) = active.capture() {
                         self.screenshot_raw = image.as_raw().to_vec();
-                        self.screenshot_width = active.display_info.width;
-                        self.screenshot_height = active.display_info.height;
+                        self.screenshot_width = image.width();
+                        self.screenshot_height = image.height();
                         let info = active.display_info;
                         self.active_screen_info = Some(ScreenInfo {
                             _id: info.id,
@@ -732,11 +841,23 @@ impl eframe::App for FloatApp {
             }
         } else if self.select_step == 3 {
             if let Some(info) = &self.active_screen_info {
-                let scale = info.scale_factor;
-                let logical_width = info.width as f32 / scale;
-                let logical_height = info.height as f32 / scale;
-                let logical_x = info.x as f32 / scale;
-                let logical_y = info.y as f32 / scale;
+                #[cfg(target_os = "windows")]
+                let (logical_width, logical_height, logical_x, logical_y) = {
+                    let scale = info.scale_factor;
+                    (
+                        info.width as f32 / scale,
+                        info.height as f32 / scale,
+                        info.x as f32 / scale,
+                        info.y as f32 / scale,
+                    )
+                };
+                #[cfg(not(target_os = "windows"))]
+                let (logical_width, logical_height, logical_x, logical_y) = (
+                    info.width as f32,
+                    info.height as f32,
+                    info.x as f32,
+                    info.y as f32,
+                );
 
                 // 调整当前窗口位置和尺寸以匹配激活屏幕全屏
                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(logical_x, logical_y)));
@@ -847,11 +968,27 @@ impl eframe::App for FloatApp {
                             let sel = egui::Rect::from_two_pos(start, end);
                             if sel.width() > 10.0 && sel.height() > 10.0 {
                                 if let Some(info) = &self.active_screen_info {
+                                    #[cfg(target_os = "windows")]
                                     let scale = info.scale_factor;
-                                    let x = (sel.min.x * scale) as i32 + info.x;
-                                    let y = (sel.min.y * scale) as i32 + info.y;
-                                    let w = (sel.width() * scale) as u32;
-                                    let h = (sel.height() * scale) as u32;
+                                    #[cfg(target_os = "windows")]
+                                    let (logical_x, logical_y) = (info.x as f32 / scale, info.y as f32 / scale);
+                                    #[cfg(not(target_os = "windows"))]
+                                    let (logical_x, logical_y) = (info.x as f32, info.y as f32);
+
+                                    #[cfg(target_os = "windows")]
+                                    let (x, y, w, h) = (
+                                        ((sel.min.x + logical_x) * scale) as i32,
+                                        ((sel.min.y + logical_y) * scale) as i32,
+                                        (sel.width() * scale) as u32,
+                                        (sel.height() * scale) as u32,
+                                    );
+                                    #[cfg(not(target_os = "windows"))]
+                                    let (x, y, w, h) = (
+                                        (sel.min.x + logical_x) as i32,
+                                        (sel.min.y + logical_y) as i32,
+                                        sel.width() as u32,
+                                        sel.height() as u32,
+                                    );
 
                                     *self.ocr_region.lock().unwrap() = Some((x, y, w, h));
                                     *self.paused.lock().unwrap() = false;
@@ -964,7 +1101,10 @@ impl eframe::App for FloatApp {
                                     .selected_text(current_backend.display_name())
                                     .width(100.0)
                                     .show_ui(ui, |ui| {
+                                        #[cfg(target_os = "windows")]
                                         ui.selectable_value(&mut current_backend, BackendType::WindowsNative, "Windows 原生");
+                                        #[cfg(target_os = "macos")]
+                                        ui.selectable_value(&mut current_backend, BackendType::MacNative, "macOS 原生");
                                         ui.selectable_value(&mut current_backend, BackendType::Tesseract,    "Tesseract");
                                         ui.selectable_value(&mut current_backend, BackendType::PaddleOcr,    "PaddleOCR");
                                         ui.selectable_value(&mut current_backend, BackendType::CloudApi,     "自定义 API");
@@ -1235,7 +1375,20 @@ fn main() -> Result<()> {
     let shared_interval = Arc::new(Mutex::new(1000u128));
     let shared_paused = Arc::new(Mutex::new(true));
     let shared_region = Arc::new(Mutex::new(None));
-    let shared_backend = Arc::new(Mutex::new(BackendType::WindowsNative));
+    let shared_backend = Arc::new(Mutex::new({
+        #[cfg(target_os = "windows")]
+        {
+            BackendType::WindowsNative
+        }
+        #[cfg(target_os = "macos")]
+        {
+            BackendType::MacNative
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        {
+            BackendType::Tesseract
+        }
+    }));
     let shared_api_url = Arc::new(Mutex::new(String::from("http://127.0.0.1:8000/ocr")));
 
     // 引擎安装状态（默认 Unchecked，启动后台线程完成初始检测）
@@ -1265,20 +1418,38 @@ fn main() -> Result<()> {
         "miaocr",
         options,
         Box::new(move |cc| {
-            // 加载系统内置微软雅黑中文字体
+            // 动态加载系统内置中文字体
             let mut fonts = egui::FontDefinitions::default();
-            fonts.font_data.insert(
-                "chinese".to_owned(),
-                egui::FontData::from_static(include_bytes!(
-                    "C:\\Windows\\Fonts\\msyh.ttc"
-                )),
-            );
-            fonts
-                .families
-                .get_mut(&egui::FontFamily::Proportional)
-                .unwrap()
-                .insert(0, "chinese".to_owned());
-            cc.egui_ctx.set_fonts(fonts);
+            let font_bytes = {
+                #[cfg(target_os = "windows")]
+                {
+                    std::fs::read("C:\\Windows\\Fonts\\msyh.ttc").ok()
+                        .or_else(|| std::fs::read("C:\\Windows\\Fonts\\msyhbd.ttc").ok())
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    std::fs::read("/System/Library/Fonts/PingFang.ttc").ok()
+                        .or_else(|| std::fs::read("/System/Library/Fonts/STHeiti Light.ttc").ok())
+                        .or_else(|| std::fs::read("/System/Library/Fonts/Supplemental/Arial Unicode.ttf").ok())
+                }
+                #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+                {
+                    None
+                }
+            };
+
+            if let Some(bytes) = font_bytes {
+                fonts.font_data.insert(
+                    "chinese".to_owned(),
+                    egui::FontData::from_owned(bytes),
+                );
+                fonts
+                    .families
+                    .get_mut(&egui::FontFamily::Proportional)
+                    .unwrap()
+                    .insert(0, "chinese".to_owned());
+                cc.egui_ctx.set_fonts(fonts);
+            }
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
             runtime_log("=== miaocr 启动 ===");
 
@@ -1374,12 +1545,12 @@ fn main() -> Result<()> {
                         }
                     }
 
-                    // 动态决定下一次识别的休眠时间（取最近 10 次的最大耗时，辅以 50ms 下限及 2000ms 上限保护）
+                    // 动态决定下一次识别的休眠时间（取最近 10 次的最大耗时，辅以 50ms 下限及 3000ms 上限保护）
                     let sleep_ms = if history.is_empty() {
                         1000
                     } else {
                         let max_elapsed = *history.iter().max().unwrap_or(&0);
-                        max_elapsed.max(50).min(2000)
+                        max_elapsed.max(50).min(3000)
                     };
 
                     *interval_for_thread.lock().unwrap() = sleep_ms as u128;
