@@ -167,6 +167,7 @@ struct FloatApp {
     paused: Arc<Mutex<bool>>,
     text: Arc<Mutex<String>>,
     elapsed: Arc<Mutex<u128>>,
+    interval: Arc<Mutex<u128>>,
 
     // 折叠展开状态
     expanded: bool,
@@ -451,16 +452,16 @@ impl eframe::App for FloatApp {
                                 sel_btn.on_hover_text("选择识别区域");
                             });
                         });
-
-                        // 如果处于展开状态，显示文本区和复制
+                    // 如果处于展开状态，显示文本区和复制
                         if self.expanded {
                             ui.separator();
 
                             ui.horizontal(|ui| {
                                 let ms = *self.elapsed.lock().unwrap();
+                                let interval = *self.interval.lock().unwrap();
                                 if ms > 0 {
                                     ui.label(
-                                        egui::RichText::new(format!("{} ms", ms))
+                                        egui::RichText::new(format!("耗时: {} ms | 间隔: {} ms", ms, interval))
                                             .color(egui::Color32::GRAY)
                                             .size(11.0),
                                     );
@@ -499,40 +500,11 @@ fn main() -> Result<()> {
     // 1. 初始化跨线程共享的状态
     let shared_text = Arc::new(Mutex::new(String::from("等待选择区域...")));
     let shared_elapsed = Arc::new(Mutex::new(0u128));
+    let shared_interval = Arc::new(Mutex::new(1000u128));
     let shared_paused = Arc::new(Mutex::new(true));
     let shared_region = Arc::new(Mutex::new(None));
 
-    let text_for_thread = shared_text.clone();
-    let elapsed_for_thread = shared_elapsed.clone();
-    let paused_for_thread = shared_paused.clone();
-    let region_for_thread = shared_region.clone();
-
-    // 2. 启动常驻 OCR 后台轮询线程
-    std::thread::spawn(move || loop {
-        let is_paused = *paused_for_thread.lock().unwrap();
-        if is_paused {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            continue;
-        }
-
-        let opt_region = *region_for_thread.lock().unwrap();
-        if let Some((x, y, w, h)) = opt_region {
-            let start = std::time::Instant::now();
-            match ocr_region(x, y, w, h) {
-                Ok(text) => {
-                    let ms = start.elapsed().as_millis();
-                    *text_for_thread.lock().unwrap() = text;
-                    *elapsed_for_thread.lock().unwrap() = ms;
-                }
-                Err(e) => {
-                    *text_for_thread.lock().unwrap() = format!("识别失败: {}", e);
-                }
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(1500));
-    });
-
-    // 3. 设定无边框、始终置顶且支持透明背景的悬浮胶囊参数
+    // 2. 设定无边框、始终置顶且支持透明背景的悬浮胶囊参数
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([200.0, 42.0])
@@ -542,6 +514,12 @@ fn main() -> Result<()> {
             .with_transparent(true),
         ..Default::default()
     };
+
+    let shared_text_clone = shared_text.clone();
+    let shared_elapsed_clone = shared_elapsed.clone();
+    let shared_interval_clone = shared_interval.clone();
+    let shared_paused_clone = shared_paused.clone();
+    let shared_region_clone = shared_region.clone();
 
     eframe::run_native(
         "miaocr",
@@ -563,6 +541,61 @@ fn main() -> Result<()> {
             cc.egui_ctx.set_fonts(fonts);
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
 
+            // 3. 启动常驻 OCR 后台轮询线程，并传入 egui_ctx 用于 UI 自动重绘
+            let ctx_clone = cc.egui_ctx.clone();
+            let text_for_thread = shared_text_clone.clone();
+            let elapsed_for_thread = shared_elapsed_clone.clone();
+            let interval_for_thread = shared_interval_clone.clone();
+            let paused_for_thread = shared_paused_clone.clone();
+            let region_for_thread = shared_region_clone.clone();
+
+            std::thread::spawn(move || {
+                let mut history = std::collections::VecDeque::with_capacity(10);
+                loop {
+                    let is_paused = *paused_for_thread.lock().unwrap();
+                    if is_paused {
+                        history.clear();
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                        continue;
+                    }
+
+                    let opt_region = *region_for_thread.lock().unwrap();
+                    if let Some((x, y, w, h)) = opt_region {
+                        let start = std::time::Instant::now();
+                        match ocr_region(x, y, w, h) {
+                            Ok(text) => {
+                                let ms = start.elapsed().as_millis();
+                                *text_for_thread.lock().unwrap() = text;
+                                *elapsed_for_thread.lock().unwrap() = ms;
+
+                                if history.len() >= 10 {
+                                    history.pop_front();
+                                }
+                                history.push_back(ms);
+                            }
+                            Err(e) => {
+                                *text_for_thread.lock().unwrap() = format!("识别失败: {}", e);
+                            }
+                        }
+                    }
+
+                    // 动态决定下一次识别的休眠时间（取最近 10 次的最大耗时，辅以 50ms 下限及 2000ms 上限保护）
+                    let sleep_ms = if history.is_empty() {
+                        1000
+                    } else {
+                        let max_elapsed = *history.iter().max().unwrap_or(&0);
+                        max_elapsed.max(50).min(2000)
+                    };
+
+                    *interval_for_thread.lock().unwrap() = sleep_ms as u128;
+
+                    // 请求 UI 重绘以更新最新结果、耗时和间隔
+                    ctx_clone.request_repaint();
+
+                    std::thread::sleep(std::time::Duration::from_millis(sleep_ms as u64));
+                }
+            });
+
             Box::new(FloatApp {
                 mode: AppMode::Float,
                 select_step: 0,
@@ -571,6 +604,7 @@ fn main() -> Result<()> {
                 paused: shared_paused,
                 text: shared_text,
                 elapsed: shared_elapsed,
+                interval: shared_interval,
                 expanded: false,
                 screenshot_texture: None,
                 screenshot_raw: Vec::new(),
