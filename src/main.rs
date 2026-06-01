@@ -107,11 +107,17 @@ fn save_temp_png(bgra: &[u8], width: u32, height: u32) -> Result<std::path::Path
 
 fn ocr_tesseract(bgra: &[u8], width: u32, height: u32) -> Result<String> {
     let temp_path = save_temp_png(bgra, width, height)?;
+
+    // 显式将 TESSDATA_PREFIX 传入子进程，防止环境变量丢失
+    let tessdata_prefix = std::env::var("TESSDATA_PREFIX")
+        .unwrap_or_else(|_| r"C:\Program Files\Tesseract-OCR\tessdata".to_string());
+
     let output = std::process::Command::new("tesseract")
         .arg(temp_path.to_str().unwrap())
         .arg("stdout")
         .arg("-l")
         .arg("chi_sim")
+        .env("TESSDATA_PREFIX", &tessdata_prefix)
         .output();
 
     let _ = std::fs::remove_file(temp_path);
@@ -178,54 +184,236 @@ fn ocr_paddle(bgra: &[u8], width: u32, height: u32) -> Result<String> {
     }
 }
 
-fn ocr_easy(bgra: &[u8], width: u32, height: u32) -> Result<String> {
-    let temp_path = save_temp_png(bgra, width, height)?;
-    let output = std::process::Command::new("easyocr")
-        .arg("-l")
-        .arg("ch_sim")
-        .arg("-f")
-        .arg(temp_path.to_str().unwrap())
-        .output();
+// ─── 引擎环境检测与自动安装 ────────────────────────────────
 
-    let _ = std::fs::remove_file(temp_path);
+/// 引擎安装状态
+#[derive(Debug, Clone, PartialEq)]
+enum InstallState {
+    Unchecked,           // 尚未检测
+    Checking,            // 检测中
+    Available,           // 已安装可用
+    NotInstalled,        // 未安装
+    Installing(String),  // 安装中，附带进度信息
+    Failed(String),      // 安装失败，附带错误信息
+}
 
-    match output {
-        Ok(out) => {
-            if out.status.success() {
-                let text = String::from_utf8_lossy(&out.stdout).to_string();
-                let mut lines = Vec::new();
-                for line in text.lines() {
-                    if let Some(start_idx) = line.find(", '") {
-                        if let Some(end_idx) = line[start_idx + 3..].find("',") {
-                            let actual_text = &line[start_idx + 3..start_idx + 3 + end_idx];
-                            lines.push(actual_text.to_string());
-                        }
-                    } else if let Some(start_idx) = line.find(", \"") {
-                        if let Some(end_idx) = line[start_idx + 3..].find("\",") {
-                            let actual_text = &line[start_idx + 3..start_idx + 3 + end_idx];
-                            lines.push(actual_text.to_string());
-                        }
-                    }
-                }
-                if lines.is_empty() {
-                    Ok(text)
-                } else {
-                    Ok(lines.join("\n"))
-                }
-            } else {
-                let err = String::from_utf8_lossy(&out.stderr).to_string();
-                Err(anyhow::anyhow!("EasyOCR 运行出错: {}", err))
-            }
+/// 检测 Tesseract 是否可用：
+/// 1. 先查 PATH（最快）
+/// 2. PATH 里没有时，检查默认安装目录是否存在 exe
+///    若在默认目录找到，则顺手将其注入当前进程 PATH。
+/// exe 找到后调用 ensure_chi_sim() 确保中文训练数据可用。
+fn detect_tesseract() -> bool {
+    // 方式 1：PATH 查找
+    let in_path = std::process::Command::new("tesseract")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if in_path {
+        ensure_chi_sim();
+        return true;
+    }
+
+    // 方式 2：检查默认安装目录（应对父进程 PATH 未刷新的情况）
+    let default_exe = std::path::Path::new(r"C:\Program Files\Tesseract-OCR\tesseract.exe");
+    if default_exe.exists() {
+        // 注入到当前进程 PATH，使后续 CLI 调用直接可用，无需重启
+        let tess_dir = r"C:\Program Files\Tesseract-OCR";
+        let cur_path = std::env::var("PATH").unwrap_or_default();
+        if !cur_path.contains(tess_dir) {
+            std::env::set_var("PATH", format!("{};{}", tess_dir, cur_path));
         }
-        Err(e) => {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                Err(anyhow::anyhow!("未在系统 PATH 中找到 easyocr.exe\n请先通过 pip install easyocr 安装，并确保在环境变量中。"))
-            } else {
-                Err(anyhow::anyhow!("调用 EasyOCR 失败: {}", e))
-            }
-        }
+        ensure_chi_sim();
+        return true;
+    }
+
+    false
+}
+
+/// 确保 chi_sim.traineddata 可用，并设置 TESSDATA_PREFIX。
+/// 检查顺序：
+///   1. ~/.miaocr/tessdata/  （用户目录，无需管理员权限）
+///   2. C:\Program Files\Tesseract-OCR\tessdata\  （系统目录）
+///   3. 以上都没有 → 自动下载到用户目录
+fn ensure_chi_sim() {
+    let user_tessdata = app_dir().join("tessdata");
+    let user_chi = user_tessdata.join("chi_sim.traineddata");
+
+    if user_chi.exists() {
+        std::env::set_var("TESSDATA_PREFIX", &user_tessdata);
+        return;
+    }
+
+    let sys_chi = std::path::Path::new(
+        r"C:\Program Files\Tesseract-OCR\tessdata\chi_sim.traineddata");
+    if sys_chi.exists() {
+        std::env::set_var("TESSDATA_PREFIX",
+            r"C:\Program Files\Tesseract-OCR\tessdata");
+        return;
+    }
+
+    // 两处都没有，自动下载到用户目录（无需管理员权限）
+    runtime_log("[TESSDATA] chi_sim.traineddata 缺失，正在下载到 ~/.miaocr/tessdata/");
+    let chi_url = "https://github.com/tesseract-ocr/tessdata_fast/raw/main/chi_sim.traineddata";
+    let status = std::process::Command::new("curl")
+        .args(["-L", "-o", user_chi.to_str().unwrap(), chi_url])
+        .status();
+    if status.map(|s| s.success()).unwrap_or(false) {
+        runtime_log("[TESSDATA] chi_sim.traineddata 下载完成");
+        std::env::set_var("TESSDATA_PREFIX", &user_tessdata);
+    } else {
+        runtime_log("[TESSDATA] chi_sim.traineddata 下载失败，请检查网络");
     }
 }
+
+/// 检测 paddleocr CLI 是否可用
+fn detect_paddle() -> bool {
+    std::process::Command::new("paddleocr")
+        .arg("--help")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+
+/// 后台异步安装 Tesseract（下载预编译安装包 + chi_sim，通过 UAC 一次性提权安装）
+fn start_tesseract_install(state: Arc<Mutex<InstallState>>, ctx: egui::Context) {
+    runtime_log("[INSTALL] Tesseract 安装开始");
+    std::thread::spawn(move || {
+        let set = |s: InstallState| {
+            *state.lock().unwrap() = s;
+            ctx.request_repaint();
+        };
+
+        let temp_dir = std::env::temp_dir();
+
+        // ── 步骤 1：获取最新版下载链接 ────────────────────────────
+        set(InstallState::Installing("正在获取最新版本信息...".into()));
+        let installer_url: String = {
+            let api_out = std::process::Command::new("curl")
+                .args(["-s", "-L",
+                       "-H", "Accept: application/vnd.github+json",
+                       "-H", "User-Agent: miaocr",
+                       "https://api.github.com/repos/UB-Mannheim/tesseract/releases/latest"])
+                .output();
+            match api_out {
+                Ok(ref o) if o.status.success() => {
+                    let json = String::from_utf8_lossy(&o.stdout);
+                    let mut found = None;
+                    let mut rest = json.as_ref();
+                    while let Some(pos) = rest.find("browser_download_url") {
+                        rest = &rest[pos + 20..];
+                        if let Some(us) = rest.find("https://") {
+                            if let Some(ue) = rest[us..].find('"') {
+                                let url = &rest[us..us + ue];
+                                if url.contains("w64-setup") && !url.ends_with(".sig") {
+                                    found = Some(url.to_string());
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    found.unwrap_or_else(|| {
+                        "https://github.com/UB-Mannheim/tesseract/releases/download/v5.5.0.20241111/tesseract-ocr-w64-setup-5.5.0.20241111.exe".to_string()
+                    })
+                }
+                _ => "https://github.com/UB-Mannheim/tesseract/releases/download/v5.5.0.20241111/tesseract-ocr-w64-setup-5.5.0.20241111.exe".to_string(),
+            }
+        };
+
+        // ── 步骤 2：下载安装包到临时目录（普通权限即可）──────────
+        let temp_installer = temp_dir.join("miaocr_tesseract_setup.exe");
+        set(InstallState::Installing("正在下载 Tesseract 安装包（约 50 MB）...".into()));
+        let dl1 = std::process::Command::new("curl")
+            .args(["-L", "-o", temp_installer.to_str().unwrap(), &installer_url])
+            .status();
+        match dl1 {
+            Ok(s) if s.success() => {}
+            Ok(s) => { set(InstallState::Failed(format!("安装包下载失败（exit {}），请检查网络", s))); return; }
+            Err(e) => { set(InstallState::Failed(format!("安装包下载失败: {}", e))); return; }
+        }
+
+        // ── 步骤 3：下载 chi_sim 中文训练数据到临时目录 ──────────
+        let temp_chi = temp_dir.join("miaocr_chi_sim.traineddata");
+        set(InstallState::Installing("正在下载中文语言包（chi_sim，约 20 MB）...".into()));
+        let chi_url = "https://github.com/tesseract-ocr/tessdata_fast/raw/main/chi_sim.traineddata";
+        let dl2 = std::process::Command::new("curl")
+            .args(["-L", "-o", temp_chi.to_str().unwrap(), chi_url])
+            .status();
+        match dl2 {
+            Ok(s) if s.success() => {}
+            Ok(s) => { set(InstallState::Failed(format!("中文语言包下载失败（exit {}），请检查网络", s))); return; }
+            Err(e) => { set(InstallState::Failed(format!("中文语言包下载失败: {}", e))); return; }
+        }
+
+        // ── 步骤 4：生成 PowerShell 安装脚本 ─────────────────────
+        // 写 C:\Program Files 需要管理员权限，统一放进脚本里以管理员身份一次执行
+        let installer_ps = temp_installer.to_str().unwrap().replace('\'', "''");
+        let chi_ps       = temp_chi.to_str().unwrap().replace('\'', "''");
+        let script = format!(
+            "$ErrorActionPreference = 'Stop'\r\nStart-Process -FilePath '{inst}' -ArgumentList '/VERYSILENT','/NORESTART','/DIR=C:\\Program Files\\Tesseract-OCR' -Wait\r\n$td = 'C:\\Program Files\\Tesseract-OCR\\tessdata'\r\nif (Test-Path '{chi}') {{ Copy-Item -Path '{chi}' -Destination \"$td\\chi_sim.traineddata\" -Force }}\r\nRemove-Item '{inst}' -Force -ErrorAction SilentlyContinue\r\nRemove-Item '{chi}'  -Force -ErrorAction SilentlyContinue\r\n",
+            inst = installer_ps,
+            chi  = chi_ps,
+        );
+
+        let script_path = temp_dir.join("miaocr_tess_install.ps1");
+        if std::fs::write(&script_path, script.as_bytes()).is_err() {
+            set(InstallState::Failed("无法创建安装脚本，请检查临时目录权限".into()));
+            return;
+        }
+
+        // ── 步骤 5：以管理员身份运行脚本（触发一次 UAC 弹窗）────
+        set(InstallState::Installing("等待 UAC 授权（请在弹窗中点击「是」）...".into()));
+        let ps_cmd = format!(
+            "Start-Process powershell -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File \"{script}\"' -Verb RunAs -Wait",
+            script = script_path.to_str().unwrap()
+        );
+        let run = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &ps_cmd])
+            .status();
+
+        let _ = std::fs::remove_file(&script_path);
+
+        match run {
+            Ok(s) if s.success() => {}
+            Ok(s) => {
+                let msg = format!("[INSTALL] Tesseract 安装脚本退出异常（exit {})", s);
+                runtime_log(&msg);
+                set(InstallState::Failed(format!(
+                    "安装脚本退出异常（exit {}）。若取消了 UAC 请重试。", s
+                )));
+                return;
+            }
+            Err(e) => {
+                runtime_log(&format!("[INSTALL] 无法启动安装脚本: {}", e));
+                set(InstallState::Failed(format!("无法启动安装脚本: {}", e)));
+                return;
+            }
+        }
+
+        // ── 步骤 6：将安装目录加入当前进程 PATH，使 CLI 立即可用 ─
+        let tess_dir = r"C:\Program Files\Tesseract-OCR";
+        let cur_path = std::env::var("PATH").unwrap_or_default();
+        if !cur_path.contains(tess_dir) {
+            std::env::set_var("PATH", format!("{};{}", tess_dir, cur_path));
+        }
+        std::env::set_var("TESSDATA_PREFIX", r"C:\Program Files\Tesseract-OCR\tessdata");
+
+        // ── 步骤 7：再次检测确认 ──────────────────────────────────
+        if detect_tesseract() {
+            set(InstallState::Available);
+        } else {
+            set(InstallState::Failed(
+                "安装完成，重启 miaocr 后 Tesseract 即可正常使用。".into()
+            ));
+        }
+    });
+}
+
 
 fn ocr_api(bgra: &[u8], width: u32, height: u32, url: &str) -> Result<String> {
     let temp_path = save_temp_png(bgra, width, height)?;
@@ -404,16 +592,6 @@ fn ocr_region(
                 .join("\n");
             Ok(clean)
         }
-        BackendType::EasyOcr => {
-            let text = ocr_easy(&bgra, final_width, final_height)?;
-            let clean: String = text
-                .lines()
-                .map(|l: &str| l.trim().to_string())
-                .filter(|l| !l.is_empty())
-                .collect::<Vec<_>>()
-                .join("\n");
-            Ok(clean)
-        }
         BackendType::CloudApi => {
             let text = ocr_api(&bgra, final_width, final_height, api_url)?;
             Ok(text)
@@ -441,7 +619,6 @@ enum BackendType {
     WindowsNative,
     Tesseract,
     PaddleOcr,
-    EasyOcr,
     CloudApi,
 }
 
@@ -449,10 +626,9 @@ impl BackendType {
     fn display_name(&self) -> &'static str {
         match self {
             BackendType::WindowsNative => "Windows 原生",
-            BackendType::Tesseract => "Tesseract (本地)",
-            BackendType::PaddleOcr => "PaddleOCR (本地)",
-            BackendType::EasyOcr => "EasyOCR (本地)",
-            BackendType::CloudApi => "自定义 API",
+            BackendType::Tesseract    => "Tesseract (本地)",
+            BackendType::PaddleOcr   => "PaddleOCR (本地)",
+            BackendType::CloudApi    => "自定义 API",
         }
     }
 }
@@ -486,6 +662,10 @@ struct FloatApp {
     interval: Arc<Mutex<u128>>,
     selected_backend: Arc<Mutex<BackendType>>,
     api_url: Arc<Mutex<String>>,
+
+    // 引擎安装状态（后台检测 / 安装线程写入）
+    tess_state:   Arc<Mutex<InstallState>>,
+    paddle_state: Arc<Mutex<InstallState>>,
 
     // 折叠展开状态
     expanded: bool,
@@ -774,27 +954,116 @@ impl eframe::App for FloatApp {
                         if self.expanded {
                             ui.separator();
 
-                            // 引擎选择 + 耗时统计 + 复制 — 合并成单行，避免换行
+                            // 引擎选择 + 状态 badge + 耗时 + 复制 — 单行布局
                             ui.horizontal(|ui| {
-                                // 引擎选择器放在最左侧
+                                // ── 引擎选择器 ──
                                 ui.label(egui::RichText::new("引擎:").size(11.0).color(egui::Color32::from_rgb(100, 200, 255)));
                                 let mut current_backend = *self.selected_backend.lock().unwrap();
                                 let prev_backend = current_backend;
-                                let combo = egui::ComboBox::from_id_source("backend_select")
+                                egui::ComboBox::from_id_source("backend_select")
                                     .selected_text(current_backend.display_name())
-                                    .width(110.0);
-                                combo.show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut current_backend, BackendType::WindowsNative, "Windows 原生");
-                                    ui.selectable_value(&mut current_backend, BackendType::Tesseract, "Tesseract (本地)");
-                                    ui.selectable_value(&mut current_backend, BackendType::PaddleOcr, "PaddleOCR (本地)");
-                                    ui.selectable_value(&mut current_backend, BackendType::EasyOcr, "EasyOCR (本地)");
-                                    ui.selectable_value(&mut current_backend, BackendType::CloudApi, "自定义 API");
-                                });
+                                    .width(100.0)
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut current_backend, BackendType::WindowsNative, "Windows 原生");
+                                        ui.selectable_value(&mut current_backend, BackendType::Tesseract,    "Tesseract");
+                                        ui.selectable_value(&mut current_backend, BackendType::PaddleOcr,    "PaddleOCR");
+                                        ui.selectable_value(&mut current_backend, BackendType::CloudApi,     "自定义 API");
+                                    });
                                 if current_backend != prev_backend {
                                     *self.selected_backend.lock().unwrap() = current_backend;
+                                    // 切换引擎时触发检测（若尚未检测）
+                                    let need_check = match current_backend {
+                                        BackendType::Tesseract => {
+                                            *self.tess_state.lock().unwrap() == InstallState::Unchecked
+                                        }
+                                        BackendType::PaddleOcr => {
+                                            *self.paddle_state.lock().unwrap() == InstallState::Unchecked
+                                        }
+                                        _ => false,
+                                    };
+                                    if need_check {
+                                        let (state_arc, ctx_clone) = match current_backend {
+                                            BackendType::Tesseract => (self.tess_state.clone(), ui.ctx().clone()),
+                                            _ => (self.paddle_state.clone(), ui.ctx().clone()),
+                                        };
+                                        *state_arc.lock().unwrap() = InstallState::Checking;
+                                        let is_tess = current_backend == BackendType::Tesseract;
+                                        std::thread::spawn(move || {
+                                            let available = if is_tess { detect_tesseract() } else { detect_paddle() };
+                                            *state_arc.lock().unwrap() = if available {
+                                                InstallState::Available
+                                            } else {
+                                                InstallState::NotInstalled
+                                            };
+                                            ctx_clone.request_repaint();
+                                        });
+                                    }
                                 }
 
-                                // 如果选择了 CloudApi，紧随其后显示 URL 输入框
+                                // ── 引擎状态 badge（仅 Tesseract / PaddleOCR 显示）──
+                                let engine_state = match current_backend {
+                                    BackendType::Tesseract => Some(self.tess_state.lock().unwrap().clone()),
+                                    BackendType::PaddleOcr => Some(self.paddle_state.lock().unwrap().clone()),
+                                    _ => None,
+                                };
+                                if let Some(state) = engine_state {
+                                    match &state {
+                                        InstallState::Unchecked => {
+                                            ui.label(egui::RichText::new("?").size(10.0).color(egui::Color32::GRAY));
+                                        }
+                                        InstallState::Checking => {
+                                            ui.label(egui::RichText::new("检测中").size(10.0).color(egui::Color32::YELLOW));
+                                        }
+                                        InstallState::Available => {
+                                            ui.label(egui::RichText::new("✓").size(11.0).color(egui::Color32::GREEN));
+                                        }
+                                        InstallState::NotInstalled => {
+                                            ui.label(egui::RichText::new("✗").size(11.0).color(egui::Color32::RED));
+                                            // 仅 Tesseract 提供一键安装
+                                            if current_backend == BackendType::Tesseract {
+                                                if ui.small_button("安装").clicked() {
+                                                    start_tesseract_install(
+                                                        self.tess_state.clone(),
+                                                        ui.ctx().clone(),
+                                                    );
+                                                }
+                                            } else {
+                                                // PaddleOCR ONNX 版本即将支持
+                                                ui.label(egui::RichText::new("未安装").size(10.0).color(egui::Color32::GRAY))
+                                                    .on_hover_text("PaddleOCR ONNX 版本即将支持，敬请期待");
+                                            }
+                                        }
+                                        InstallState::Installing(msg) => {
+                                            ui.label(
+                                                egui::RichText::new(format!("⏳ {}", msg))
+                                                    .size(10.0)
+                                                    .color(egui::Color32::from_rgb(255, 200, 50)),
+                                            );
+                                        }
+                                        InstallState::Failed(err) => {
+                                            let short = if err.chars().count() > 12 {
+                                                format!("{}…", &err.chars().take(12).collect::<String>())
+                                            } else {
+                                                err.clone()
+                                            };
+                                            ui.label(
+                                                egui::RichText::new(format!("✗ {}", short))
+                                                    .size(10.0)
+                                                    .color(egui::Color32::RED),
+                                            ).on_hover_text(err.as_str());
+                                            if current_backend == BackendType::Tesseract
+                                                && ui.small_button("重试").clicked()
+                                            {
+                                                start_tesseract_install(
+                                                    self.tess_state.clone(),
+                                                    ui.ctx().clone(),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // ── CloudApi URL 输入框 ──
                                 if current_backend == BackendType::CloudApi {
                                     let mut url = self.api_url.lock().unwrap().clone();
                                     ui.label(egui::RichText::new("URL:").size(11.0).color(egui::Color32::from_rgb(100, 200, 255)));
@@ -803,7 +1072,7 @@ impl eframe::App for FloatApp {
                                     }
                                 }
 
-                                // 耗时信息 + 复制按钮放右侧
+                                // ── 耗时 + 复制（右对齐）──
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     let text = self.text.lock().unwrap().clone();
                                     if ui.button("复制").clicked() {
@@ -813,7 +1082,7 @@ impl eframe::App for FloatApp {
                                     let interval = *self.interval.lock().unwrap();
                                     if ms > 0 {
                                         ui.label(
-                                            egui::RichText::new(format!("耗时{}ms|间隔{}ms", ms, interval))
+                                            egui::RichText::new(format!("{}ms|{}ms", ms, interval))
                                                 .color(egui::Color32::GRAY)
                                                 .size(10.0),
                                         );
@@ -840,6 +1109,38 @@ impl eframe::App for FloatApp {
     }
 }
 
+// ─── 应用数据目录 ───────────────────────────────────────────
+
+/// 返回 ~/.miaocr 路径，并确保目录结构存在：
+///   ~/.miaocr/            ← 根目录（运行日志、配置）
+///   ~/.miaocr/models/     ← 模型文件（未来 PaddleOCR ONNX 等）
+fn app_dir() -> std::path::PathBuf {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let dir = home.join(".miaocr");
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::create_dir_all(dir.join("models"));
+    let _ = std::fs::create_dir_all(dir.join("tessdata")); // chi_sim 等训练数据，无需管理员权限
+    dir
+}
+
+/// 追加一条运行日志到 ~/.miaocr/miaocr.log
+/// 用于记录程序错误、引擎安装事件等，方便排查 bug，与识别结果文件分开
+fn runtime_log(msg: &str) {
+    use std::io::Write;
+    let log_path = app_dir().join("miaocr.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+    {
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+        let _ = writeln!(f, "[{}] {}", now, msg);
+    }
+}
+
 // ─── 主入口 ──────────────────────────────────────────────
 
 struct LogManager {
@@ -857,7 +1158,7 @@ impl LogManager {
             .read(true)
             .write(true)
             .create(true)
-            .open("ocr_log.txt")
+            .open("ocr_log.txt")  // 识别结果写入当前目录，方便用户查看
             .ok();
         
         let mut mgr = Self {
@@ -937,6 +1238,10 @@ fn main() -> Result<()> {
     let shared_backend = Arc::new(Mutex::new(BackendType::WindowsNative));
     let shared_api_url = Arc::new(Mutex::new(String::from("http://127.0.0.1:8000/ocr")));
 
+    // 引擎安装状态（默认 Unchecked，启动后台线程完成初始检测）
+    let shared_tess_state   = Arc::new(Mutex::new(InstallState::Unchecked));
+    let shared_paddle_state = Arc::new(Mutex::new(InstallState::Unchecked));
+
     // 2. 设定无边框、始终置顶且支持透明背景的悬浮胶囊参数
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -975,8 +1280,47 @@ fn main() -> Result<()> {
                 .insert(0, "chinese".to_owned());
             cc.egui_ctx.set_fonts(fonts);
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            runtime_log("=== miaocr 启动 ===");
 
-            // 3. 启动常驻 OCR 后台轮询线程，并传入 egui_ctx 用于 UI 自动重绘
+            // 3. 启动引擎环境初始检测线程（启动时静默检测 Tesseract / PaddleOCR）
+            {
+                let tess_state   = shared_tess_state.clone();
+                let paddle_state = shared_paddle_state.clone();
+                let ctx_detect = cc.egui_ctx.clone();
+                std::thread::spawn(move || {
+                    // 并发检测两个引擎
+                    let t1 = {
+                        let ts = tess_state.clone();
+                        let c  = ctx_detect.clone();
+                        std::thread::spawn(move || {
+                            *ts.lock().unwrap() = InstallState::Checking;
+                            c.request_repaint();
+                            let avail = detect_tesseract();
+                            runtime_log(&format!("[DETECT] Tesseract: {}",
+                                if avail { "已安装" } else { "未安装" }));
+                            *ts.lock().unwrap() = if avail { InstallState::Available } else { InstallState::NotInstalled };
+                            c.request_repaint();
+                        })
+                    };
+                    let t2 = {
+                        let ps = paddle_state.clone();
+                        let c  = ctx_detect.clone();
+                        std::thread::spawn(move || {
+                            *ps.lock().unwrap() = InstallState::Checking;
+                            c.request_repaint();
+                            let avail = detect_paddle();
+                            runtime_log(&format!("[DETECT] PaddleOCR: {}",
+                                if avail { "已安装" } else { "未安装" }));
+                            *ps.lock().unwrap() = if avail { InstallState::Available } else { InstallState::NotInstalled };
+                            c.request_repaint();
+                        })
+                    };
+                    let _ = t1.join();
+                    let _ = t2.join();
+                });
+            }
+
+            // 4. 启动常驻 OCR 后台轮询线程，并传入 egui_ctx 用于 UI 自动重绘
             let ctx_clone = cc.egui_ctx.clone();
             let text_for_thread = shared_text_clone.clone();
             let elapsed_for_thread = shared_elapsed_clone.clone();
@@ -989,6 +1333,7 @@ fn main() -> Result<()> {
             std::thread::spawn(move || {
                 let mut history = std::collections::VecDeque::with_capacity(10);
                 let mut log_mgr = LogManager::new();
+                let mut last_error: Option<String> = None; // 去重，避免同一错误反复写入运行日志
                 loop {
                     let is_paused = *paused_for_thread.lock().unwrap();
                     if is_paused {
@@ -1006,10 +1351,10 @@ fn main() -> Result<()> {
                         match ocr_region(x, y, w, h, backend, &url) {
                             Ok(text) => {
                                 let ms = start.elapsed().as_millis();
-                                
                                 log_mgr.log(&text);
                                 *text_for_thread.lock().unwrap() = text;
                                 *elapsed_for_thread.lock().unwrap() = ms;
+                                last_error = None; // 成功后重置，下次出错时重新记录
 
                                 if history.len() >= 10 {
                                     history.pop_front();
@@ -1017,7 +1362,14 @@ fn main() -> Result<()> {
                                 history.push_back(ms);
                             }
                             Err(e) => {
-                                *text_for_thread.lock().unwrap() = format!("识别失败: {}", e);
+                                let msg = format!("识别失败: {}", e);
+                                let err_str = format!("[OCR ERROR] backend={:?} {}", backend, e);
+                                // 仅当错误内容变化时才写入运行日志，避免高频刷写
+                                if last_error.as_deref() != Some(&err_str) {
+                                    runtime_log(&err_str);
+                                    last_error = Some(err_str);
+                                }
+                                *text_for_thread.lock().unwrap() = msg;
                             }
                         }
                     }
@@ -1050,6 +1402,8 @@ fn main() -> Result<()> {
                 interval: shared_interval,
                 selected_backend: shared_backend,
                 api_url: shared_api_url,
+                tess_state:   shared_tess_state,
+                paddle_state: shared_paddle_state,
                 expanded: false,
                 screenshot_texture: None,
                 screenshot_raw: Vec::new(),
