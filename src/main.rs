@@ -113,156 +113,6 @@ fn ocr_region(x: i32, y: i32, width: u32, height: u32) -> Result<String> {
     Ok(clean)
 }
 
-// ─── 选区窗口 ────────────────────────────────────────────
-
-struct SelectorApp {
-    screenshot_texture: Option<egui::TextureHandle>,
-    screenshot_rgba: Vec<u8>,
-    screenshot_width: u32,
-    screenshot_height: u32,
-    drag_start: Option<egui::Pos2>,
-    drag_end: Option<egui::Pos2>,
-    done: bool,
-    result: Option<(i32, i32, u32, u32)>,
-}
-
-impl SelectorApp {
-    fn new(rgba: Vec<u8>, width: u32, height: u32) -> Self {
-        Self {
-            screenshot_texture: None,
-            screenshot_rgba: rgba,
-            screenshot_width: width,
-            screenshot_height: height,
-            drag_start: None,
-            drag_end: None,
-            done: false,
-            result: None,
-        }
-    }
-}
-
-impl eframe::App for SelectorApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if self.screenshot_texture.is_none() {
-            let image = egui::ColorImage::from_rgba_unmultiplied(
-                [self.screenshot_width as usize, self.screenshot_height as usize],
-                &self.screenshot_rgba,
-            );
-            self.screenshot_texture = Some(ctx.load_texture(
-                "screenshot",
-                image,
-                egui::TextureOptions::LINEAR,
-            ));
-        }
-
-        egui::CentralPanel::default()
-            .frame(egui::Frame::none())
-            .show(ctx, |ui| {
-                let rect = ui.available_rect_before_wrap();
-
-                if let Some(tex) = &self.screenshot_texture {
-                    ui.painter().image(
-                        tex.id(),
-                        rect,
-                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        egui::Color32::WHITE,
-                    );
-                }
-
-                ui.painter().rect_filled(
-                    rect,
-                    0.0,
-                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 80),
-                );
-
-                ui.painter().text(
-                    egui::pos2(rect.width() / 2.0, 30.0),
-                    egui::Align2::CENTER_TOP,
-                    "拖拽选择持续识别区域  |  ESC 取消",
-                    egui::FontId::proportional(18.0),
-                    egui::Color32::WHITE,
-                );
-
-                let response = ui.interact(rect, ui.id(), egui::Sense::drag());
-
-                if response.drag_started() {
-                    self.drag_start = ctx.input(|i| i.pointer.press_origin());
-                }
-                if response.dragged() {
-                    self.drag_end = ctx.input(|i| i.pointer.hover_pos());
-                }
-
-                if let (Some(start), Some(end)) = (self.drag_start, self.drag_end) {
-                    let sel = egui::Rect::from_two_pos(start, end);
-
-                    if let Some(tex) = &self.screenshot_texture {
-                        let uv_min = egui::pos2(sel.min.x / rect.width(), sel.min.y / rect.height());
-                        let uv_max = egui::pos2(sel.max.x / rect.width(), sel.max.y / rect.height());
-                        ui.painter().image(
-                            tex.id(),
-                            sel,
-                            egui::Rect::from_min_max(uv_min, uv_max),
-                            egui::Color32::WHITE,
-                        );
-                    }
-
-                    ui.painter().rect_stroke(
-                        sel,
-                        0.0,
-                        egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 200, 255)),
-                    );
-
-                    ui.painter().text(
-                        sel.min + egui::vec2(4.0, 4.0),
-                        egui::Align2::LEFT_TOP,
-                        format!("{:.0} × {:.0}", sel.width(), sel.height()),
-                        egui::FontId::proportional(13.0),
-                        egui::Color32::WHITE,
-                    );
-                }
-
-                if response.drag_stopped() {
-                    if let (Some(start), Some(end)) = (self.drag_start, self.drag_end) {
-                        let sel = egui::Rect::from_two_pos(start, end);
-                        if sel.width() > 10.0 && sel.height() > 10.0 {
-                            self.result = Some((
-                                sel.min.x as i32,
-                                sel.min.y as i32,
-                                sel.width() as u32,
-                                sel.height() as u32,
-                            ));
-                            self.done = true;
-                        }
-                    }
-                }
-
-                if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                    self.done = true;
-                }
-            });
-
-        if self.done {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
-    }
-}
-
-struct SelectorWrapper {
-    inner: SelectorApp,
-    result_out: Arc<Mutex<Option<(i32, i32, u32, u32)>>>,
-}
-
-impl eframe::App for SelectorWrapper {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        self.inner.update(ctx, frame);
-        if self.inner.done {
-            if let Some(r) = self.inner.result {
-                *self.result_out.lock().unwrap() = Some(r);
-            }
-        }
-    }
-}
-
 fn get_cursor_pos() -> Option<(i32, i32)> {
     use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
     use windows::Win32::Foundation::POINT;
@@ -276,197 +126,407 @@ fn get_cursor_pos() -> Option<(i32, i32)> {
     }
 }
 
-fn select_region() -> Option<(i32, i32, u32, u32)> {
-    let screens = Screen::all().ok()?;
+// ─── 悬浮窗应用 ──────────────────────────────────────────
 
-    // 打印屏幕信息方便调试
-    for s in &screens {
-        let info = s.display_info;
-        println!(
-            "屏幕: id={} x={} y={} width={} height={} scale={}",
-            info.id, info.x, info.y, info.width, info.height, info.scale_factor
-        );
-    }
-
-    // 获取当前鼠标位置，找到鼠标所在的屏幕
-    let (mx, my) = get_cursor_pos().unwrap_or((0, 0));
-    println!("鼠标当前位置: ({}, {})", mx, my);
-
-    let active_screen = screens
-        .iter()
-        .find(|s| {
-            let info = s.display_info;
-            mx >= info.x
-                && mx < info.x + info.width as i32
-                && my >= info.y
-                && my < info.y + info.height as i32
-        })
-        .unwrap_or(&screens[0]);
-
-    let info = active_screen.display_info;
-    println!(
-        "激活屏幕: id={} x={} y={} width={} height={} scale={}",
-        info.id, info.x, info.y, info.width, info.height, info.scale_factor
-    );
-
-    // 仅截取激活屏幕的内容
-    let image = active_screen.capture().ok()?;
-    let canvas = image.as_raw().to_vec();
-    let total_width = info.width;
-    let total_height = info.height;
-
-    let result = Arc::new(Mutex::new(None));
-    let result_clone = result.clone();
-
-    let scale = info.scale_factor;
-    // egui 用逻辑像素，物理像素除以缩放比得到逻辑尺寸
-    let logical_width = total_width as f32 / scale;
-    let logical_height = total_height as f32 / scale;
-    let logical_x = info.x as f32 / scale;
-    let logical_y = info.y as f32 / scale;
-
-    println!(
-        "激活屏幕逻辑尺寸: {}x{} 逻辑位置: ({}, {}) scale={}",
-        logical_width, logical_height, logical_x, logical_y, scale
-    );
-
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([logical_width, logical_height])
-            .with_position([logical_x, logical_y])
-            .with_decorations(false)
-            .with_always_on_top(),
-        ..Default::default()
-    };
-
-    eframe::run_native(
-        "miaocr-selector",
-        options,
-        Box::new(move |cc| {
-            let mut fonts = egui::FontDefinitions::default();
-            fonts.font_data.insert(
-                "chinese".to_owned(),
-                egui::FontData::from_static(include_bytes!(
-                    "C:\\Windows\\Fonts\\msyh.ttc"
-                )),
-            );
-            fonts
-                .families
-                .get_mut(&egui::FontFamily::Proportional)
-                .unwrap()
-                .insert(0, "chinese".to_owned());
-            cc.egui_ctx.set_fonts(fonts);
-
-            Box::new(SelectorWrapper {
-                inner: SelectorApp::new(canvas, total_width, total_height),
-                result_out: result_clone,
-            }) as Box<dyn eframe::App>
-        }),
-    )
-    .ok()?;
-
-    // 选区坐标是逻辑像素，转回物理像素
-    let x = result.lock().ok()?.take();
-    x.map(|(rx, ry, rw, rh)| {
-        (
-            (rx as f32 * scale) as i32 + info.x,
-            (ry as f32 * scale) as i32 + info.y,
-            (rw as f32 * scale) as u32,
-            (rh as f32 * scale) as u32,
-        )
-    })
+#[derive(PartialEq)]
+enum AppMode {
+    Float,      // 悬浮面板状态
+    Selecting,  // 屏幕选区状态
 }
 
-// ─── 结果悬浮窗 ──────────────────────────────────────────
+#[derive(Clone, Copy)]
+struct ScreenInfo {
+    _id: u32,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    scale_factor: f32,
+}
 
-struct ResultApp {
+struct FloatApp {
+    mode: AppMode,
+    select_step: u8,
+    frame_delay: u8,
+
+    // OCR 共享状态
+    ocr_region: Arc<Mutex<Option<(i32, i32, u32, u32)>>>,
+    paused: Arc<Mutex<bool>>,
     text: Arc<Mutex<String>>,
     elapsed: Arc<Mutex<u128>>,
+
+    // 折叠展开状态
+    expanded: bool,
+
+    // 选区相关的临时截图数据
+    screenshot_texture: Option<egui::TextureHandle>,
+    screenshot_raw: Vec<u8>,
+    screenshot_width: u32,
+    screenshot_height: u32,
+    active_screen_info: Option<ScreenInfo>,
+    drag_start: Option<egui::Pos2>,
+    drag_end: Option<egui::Pos2>,
+
+    // 记忆悬浮窗位置，以便选区完后复位
+    float_pos: egui::Pos2,
 }
 
-impl eframe::App for ResultApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 每500ms刷新一次
-        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+impl eframe::App for FloatApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        egui::Rgba::TRANSPARENT.to_array()
+    }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("miaocr");
-                let ms = *self.elapsed.lock().unwrap();
-                if ms > 0 {
-                    ui.label(
-                        egui::RichText::new(format!("{}ms", ms))
-                            .color(egui::Color32::GRAY)
-                            .size(12.0),
-                    );
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 1. 截图隐藏逻辑的状态机处理
+        if self.select_step == 1 {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(-10000.0, -10000.0)));
+            self.select_step = 2;
+            self.frame_delay = 5;
+        } else if self.select_step == 2 {
+            if self.frame_delay > 0 {
+                self.frame_delay -= 1;
+                ctx.request_repaint(); // 强制刷新以将隐藏事件发往 Windows 窗口管理器
+            } else {
+                // 截图鼠标所在的屏幕
+                if let Some(screens) = Screen::all().ok() {
+                    let (mx, my) = get_cursor_pos().unwrap_or((0, 0));
+                    let active = screens
+                        .iter()
+                        .find(|s| {
+                            let info = s.display_info;
+                            mx >= info.x
+                                && mx < info.x + info.width as i32
+                                && my >= info.y
+                                && my < info.y + info.height as i32
+                        })
+                        .unwrap_or(&screens[0]);
+
+                    if let Ok(image) = active.capture() {
+                        self.screenshot_raw = image.as_raw().to_vec();
+                        self.screenshot_width = active.display_info.width;
+                        self.screenshot_height = active.display_info.height;
+                        let info = active.display_info;
+                        self.active_screen_info = Some(ScreenInfo {
+                            _id: info.id,
+                            x: info.x,
+                            y: info.y,
+                            width: info.width,
+                            height: info.height,
+                            scale_factor: info.scale_factor,
+                        });
+                    }
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let text = self.text.lock().unwrap().clone();
-                    if ui.button("复制").clicked() {
-                        ui.output_mut(|o| o.copied_text = text);
+                self.select_step = 3;
+            }
+        } else if self.select_step == 3 {
+            if let Some(info) = &self.active_screen_info {
+                let scale = info.scale_factor;
+                let logical_width = info.width as f32 / scale;
+                let logical_height = info.height as f32 / scale;
+                let logical_x = info.x as f32 / scale;
+                let logical_y = info.y as f32 / scale;
+
+                // 调整当前窗口位置和尺寸以匹配激活屏幕全屏
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(logical_x, logical_y)));
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(logical_width, logical_height)));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+
+                self.mode = AppMode::Selecting;
+                self.drag_start = None;
+                self.drag_end = None;
+                self.screenshot_texture = None;
+            }
+            self.select_step = 0;
+        }
+
+        // 当处于悬浮窗模式且没有进行隐藏截图时，持续记录当前窗口坐标，用于选区完成后复位
+        if self.mode == AppMode::Float && self.select_step == 0 {
+            if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
+                if rect.min.x > -9000.0 && rect.min.y > -9000.0 {
+                    self.float_pos = rect.min;
+                }
+            }
+        }
+
+        // 2. 选择区域模式渲染
+        if self.mode == AppMode::Selecting {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none().fill(egui::Color32::TRANSPARENT))
+                .show(ctx, |ui| {
+                    let rect = ui.available_rect_before_wrap();
+
+                    if self.screenshot_texture.is_none() && !self.screenshot_raw.is_empty() {
+                        let image = egui::ColorImage::from_rgba_unmultiplied(
+                            [self.screenshot_width as usize, self.screenshot_height as usize],
+                            &self.screenshot_raw,
+                        );
+                        self.screenshot_texture = Some(ctx.load_texture(
+                            "screenshot",
+                            image,
+                            egui::TextureOptions::LINEAR,
+                        ));
+                    }
+
+                    if let Some(tex) = &self.screenshot_texture {
+                        ui.painter().image(
+                            tex.id(),
+                            rect,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                    }
+
+                    // 黑色半透明覆盖遮罩
+                    ui.painter().rect_filled(
+                        rect,
+                        0.0,
+                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 80),
+                    );
+
+                    // 绘制顶部操作说明
+                    ui.painter().text(
+                        egui::pos2(rect.width() / 2.0, 40.0),
+                        egui::Align2::CENTER_TOP,
+                        "拖拽选择持续识别区域  |  ESC 取消",
+                        egui::FontId::proportional(18.0),
+                        egui::Color32::WHITE,
+                    );
+
+                    let response = ui.interact(rect, ui.id(), egui::Sense::drag());
+
+                    if response.drag_started() {
+                        self.drag_start = ctx.input(|i| i.pointer.press_origin());
+                    }
+                    if response.dragged() {
+                        self.drag_end = ctx.input(|i| i.pointer.hover_pos());
+                    }
+
+                    if let (Some(start), Some(end)) = (self.drag_start, self.drag_end) {
+                        let sel = egui::Rect::from_two_pos(start, end);
+
+                        if let Some(tex) = &self.screenshot_texture {
+                            let uv_min = egui::pos2(sel.min.x / rect.width(), sel.min.y / rect.height());
+                            let uv_max = egui::pos2(sel.max.x / rect.width(), sel.max.y / rect.height());
+                            ui.painter().image(
+                                tex.id(),
+                                sel,
+                                egui::Rect::from_min_max(uv_min, uv_max),
+                                egui::Color32::WHITE,
+                            );
+                        }
+
+                        ui.painter().rect_stroke(
+                            sel,
+                            0.0,
+                            egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 200, 255)),
+                        );
+
+                        ui.painter().text(
+                            sel.min + egui::vec2(4.0, -18.0),
+                            egui::Align2::LEFT_TOP,
+                            format!("{:.0} × {:.0}", sel.width(), sel.height()),
+                            egui::FontId::proportional(13.0),
+                            egui::Color32::WHITE,
+                        );
+                    }
+
+                    if response.drag_stopped() {
+                        if let (Some(start), Some(end)) = (self.drag_start, self.drag_end) {
+                            let sel = egui::Rect::from_two_pos(start, end);
+                            if sel.width() > 10.0 && sel.height() > 10.0 {
+                                if let Some(info) = &self.active_screen_info {
+                                    let scale = info.scale_factor;
+                                    let x = (sel.min.x * scale) as i32 + info.x;
+                                    let y = (sel.min.y * scale) as i32 + info.y;
+                                    let w = (sel.width() * scale) as u32;
+                                    let h = (sel.height() * scale) as u32;
+
+                                    *self.ocr_region.lock().unwrap() = Some((x, y, w, h));
+                                    *self.paused.lock().unwrap() = false;
+                                }
+                            }
+                        }
+                        // 还原到悬浮窗尺寸
+                        let size = if self.expanded {
+                            egui::vec2(350.0, 260.0)
+                        } else {
+                            egui::vec2(200.0, 42.0)
+                        };
+                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(self.float_pos));
+                        self.mode = AppMode::Float;
+                    }
+
+                    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        let size = if self.expanded {
+                            egui::vec2(350.0, 260.0)
+                        } else {
+                            egui::vec2(200.0, 42.0)
+                        };
+                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(self.float_pos));
+                        self.mode = AppMode::Float;
                     }
                 });
-            });
+        }
 
-            ui.separator();
+        // 3. 悬浮卡片模式渲染
+        if self.mode == AppMode::Float {
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::viewport::WindowLevel::AlwaysOnTop));
 
-            let text = self.text.lock().unwrap().clone();
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.add(
-                    egui::TextEdit::multiline(&mut text.as_str())
-                        .desired_width(f32::INFINITY)
-                        .font(egui::FontId::proportional(15.0)),
-                );
-            });
-        });
+            // 半透明暗色卡片风格
+            let card_frame = egui::Frame::none()
+                .fill(egui::Color32::from_rgba_unmultiplied(20, 20, 25, 220))
+                .rounding(egui::Rounding::same(8.0))
+                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30)))
+                .inner_margin(egui::Margin::symmetric(8.0, 6.0));
+
+            egui::CentralPanel::default()
+                .frame(card_frame)
+                .show(ctx, |ui| {
+                    ui.vertical(|ui| {
+                        // 顶部操作栏
+                        ui.horizontal(|ui| {
+                            let title_lbl = ui.label(
+                                egui::RichText::new("miaocr")
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(100, 200, 255)),
+                            );
+                            let title_rect = title_lbl.rect;
+                            let drag_res = ui.interact(title_rect, ui.id().with("drag"), egui::Sense::drag());
+                            if drag_res.dragged() {
+                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                            }
+                            drag_res.on_hover_text("按住此处拖拽窗口");
+
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                // 展开 / 收起折叠按钮
+                                let exp_text = if self.expanded { "折叠" } else { "展开" };
+                                if ui.button(exp_text).clicked() {
+                                    self.expanded = !self.expanded;
+                                    let size = if self.expanded {
+                                        egui::vec2(350.0, 260.0)
+                                    } else {
+                                        egui::vec2(200.0, 42.0)
+                                    };
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                                }
+
+                                // 播放 / 暂停按钮 (只有在有有效选区时才显示)
+                                let has_region = self.ocr_region.lock().unwrap().is_some();
+                                if has_region {
+                                    let is_paused = *self.paused.lock().unwrap();
+                                    let play_pause_btn = if is_paused { "继续" } else { "暂停" };
+                                    let btn_res = ui.button(play_pause_btn);
+                                    if btn_res.clicked() {
+                                        let mut p = self.paused.lock().unwrap();
+                                        *p = !*p;
+                                    }
+                                    btn_res.on_hover_text(if is_paused { "继续识别" } else { "暂停识别" });
+                                }
+
+                                // 选择选区按钮
+                                let sel_btn = ui.button("选区");
+                                if sel_btn.clicked() {
+                                    if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
+                                        if rect.min.x > -9000.0 && rect.min.y > -9000.0 {
+                                            self.float_pos = rect.min;
+                                        }
+                                    }
+                                    self.select_step = 1;
+                                }
+                                sel_btn.on_hover_text("选择识别区域");
+                            });
+                        });
+
+                        // 如果处于展开状态，显示文本区和复制
+                        if self.expanded {
+                            ui.separator();
+
+                            ui.horizontal(|ui| {
+                                let ms = *self.elapsed.lock().unwrap();
+                                if ms > 0 {
+                                    ui.label(
+                                        egui::RichText::new(format!("{} ms", ms))
+                                            .color(egui::Color32::GRAY)
+                                            .size(11.0),
+                                    );
+                                }
+
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    let text = self.text.lock().unwrap().clone();
+                                    if ui.button("复制").clicked() {
+                                        ui.output_mut(|o| o.copied_text = text);
+                                    }
+                                });
+                            });
+
+                            ui.add_space(4.0);
+
+                            let text = self.text.lock().unwrap().clone();
+                            egui::ScrollArea::vertical()
+                                .max_height(160.0)
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::TextEdit::multiline(&mut text.as_str())
+                                            .desired_width(f32::INFINITY)
+                                            .font(egui::FontId::proportional(14.0)),
+                                    );
+                                });
+                        }
+                    });
+                });
+        }
     }
 }
 
-// ─── 主函数 ──────────────────────────────────────────────
+// ─── 主入口 ──────────────────────────────────────────────
 
 fn main() -> Result<()> {
-    // 1. 选区
-    let region = select_region();
-    let (x, y, w, h) = match region {
-        None => {
-            println!("未选择区域，退出");
-            return Ok(());
-        }
-        Some(r) => r,
-    };
-
-    println!("识别区域: {}x{}+{}+{}", w, h, x, y);
-
-    // 2. 共享状态
-    let shared_text = Arc::new(Mutex::new(String::from("识别中...")));
+    // 1. 初始化跨线程共享的状态
+    let shared_text = Arc::new(Mutex::new(String::from("等待选择区域...")));
     let shared_elapsed = Arc::new(Mutex::new(0u128));
+    let shared_paused = Arc::new(Mutex::new(true));
+    let shared_region = Arc::new(Mutex::new(None));
 
     let text_for_thread = shared_text.clone();
     let elapsed_for_thread = shared_elapsed.clone();
+    let paused_for_thread = shared_paused.clone();
+    let region_for_thread = shared_region.clone();
 
-    // 3. 后台识别线程
+    // 2. 启动常驻 OCR 后台轮询线程
     std::thread::spawn(move || loop {
-        let start = std::time::Instant::now();
-        match ocr_region(x, y, w, h) {
-            Ok(text) => {
-                let ms = start.elapsed().as_millis();
-                *text_for_thread.lock().unwrap() = text;
-                *elapsed_for_thread.lock().unwrap() = ms;
-            }
-            Err(e) => {
-                *text_for_thread.lock().unwrap() = format!("识别失败: {}", e);
+        let is_paused = *paused_for_thread.lock().unwrap();
+        if is_paused {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            continue;
+        }
+
+        let opt_region = *region_for_thread.lock().unwrap();
+        if let Some((x, y, w, h)) = opt_region {
+            let start = std::time::Instant::now();
+            match ocr_region(x, y, w, h) {
+                Ok(text) => {
+                    let ms = start.elapsed().as_millis();
+                    *text_for_thread.lock().unwrap() = text;
+                    *elapsed_for_thread.lock().unwrap() = ms;
+                }
+                Err(e) => {
+                    *text_for_thread.lock().unwrap() = format!("识别失败: {}", e);
+                }
             }
         }
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        std::thread::sleep(std::time::Duration::from_millis(1500));
     });
 
-    // 4. 结果悬浮窗
+    // 3. 设定无边框、始终置顶且支持透明背景的悬浮胶囊参数
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([400.0, 300.0])
-            .with_position([20.0, 20.0])
-            .with_title("miaocr")
-            .with_always_on_top(),
+            .with_inner_size([200.0, 42.0])
+            .with_position([100.0, 100.0])
+            .with_decorations(false)
+            .with_always_on_top()
+            .with_transparent(true),
         ..Default::default()
     };
 
@@ -474,7 +534,7 @@ fn main() -> Result<()> {
         "miaocr",
         options,
         Box::new(move |cc| {
-            // 加载中文字体
+            // 加载系统内置微软雅黑中文字体
             let mut fonts = egui::FontDefinitions::default();
             fonts.font_data.insert(
                 "chinese".to_owned(),
@@ -488,10 +548,25 @@ fn main() -> Result<()> {
                 .unwrap()
                 .insert(0, "chinese".to_owned());
             cc.egui_ctx.set_fonts(fonts);
+            cc.egui_ctx.set_visuals(egui::Visuals::dark());
 
-            Box::new(ResultApp {
+            Box::new(FloatApp {
+                mode: AppMode::Float,
+                select_step: 0,
+                frame_delay: 0,
+                ocr_region: shared_region,
+                paused: shared_paused,
                 text: shared_text,
                 elapsed: shared_elapsed,
+                expanded: false,
+                screenshot_texture: None,
+                screenshot_raw: Vec::new(),
+                screenshot_width: 0,
+                screenshot_height: 0,
+                active_screen_info: None,
+                drag_start: None,
+                drag_end: None,
+                float_pos: egui::pos2(100.0, 100.0),
             }) as Box<dyn eframe::App>
         }),
     )
