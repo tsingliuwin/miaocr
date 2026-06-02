@@ -143,8 +143,172 @@ fn ocr_tesseract(bgra: &[u8], width: u32, height: u32) -> Result<String> {
     }
 }
 
+use std::process::{Child, Command, Stdio};
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+
+struct JsonOcrEngine {
+    child: Child,
+    stdout_reader: BufReader<std::process::ChildStdout>,
+    stdin_writer: std::process::ChildStdin,
+}
+
+impl JsonOcrEngine {
+    fn new(exe_path: &Path) -> Result<Self> {
+        let exe_dir = exe_path.parent().ok_or_else(|| anyhow::anyhow!("Invalid executable path"))?;
+        
+        let mut child = Command::new(exe_path)
+            .current_dir(exe_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+            
+        let stdin_writer = child.stdin.take().ok_or_else(|| anyhow::anyhow!("Failed to open stdin"))?;
+        let stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("Failed to open stdout"))?;
+        let mut stdout_reader = BufReader::new(stdout);
+        
+        // Wait for "OCR init completed."
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let bytes_read = stdout_reader.read_line(&mut line)?;
+            if bytes_read == 0 {
+                return Err(anyhow::anyhow!("OCR engine exited or closed stdout prematurely during initialization"));
+            }
+            if line.contains("OCR init completed.") {
+                break;
+            }
+        }
+        
+        Ok(Self {
+            child,
+            stdout_reader,
+            stdin_writer,
+        })
+    }
+    
+    fn ocr(&mut self, image_path: &Path) -> Result<String> {
+        let path_str = image_path.to_string_lossy().replace('\\', "/");
+        let cmd = serde_json::json!({
+            "image_path": path_str
+        });
+        
+        let mut cmd_str = serde_json::to_string(&cmd)?;
+        cmd_str.push('\n');
+        
+        self.stdin_writer.write_all(cmd_str.as_bytes())?;
+        self.stdin_writer.flush()?;
+        
+        let mut line = String::new();
+        let bytes_read = self.stdout_reader.read_line(&mut line)?;
+        if bytes_read == 0 {
+            return Err(anyhow::anyhow!("OCR engine closed stdout connection unexpectedly"));
+        }
+        
+        let resp: serde_json::Value = serde_json::from_str(&line)?;
+        let code = resp["code"].as_i64().unwrap_or(-1);
+        if code == 100 {
+            if let Some(data) = resp["data"].as_array() {
+                let mut lines = Vec::new();
+                for item in data {
+                    if let Some(text) = item["text"].as_str() {
+                        lines.push(text.to_string());
+                    }
+                }
+                Ok(lines.join("\n"))
+            } else {
+                Ok(String::new())
+            }
+        } else if code == 101 {
+            Ok(String::new())
+        } else {
+            let err_msg = resp["msg"].as_str().unwrap_or("Unknown error").to_string();
+            Err(anyhow::anyhow!("OCR engine error: {} (code {})", err_msg, code))
+        }
+    }
+}
+
+impl Drop for JsonOcrEngine {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn find_paddle_exe() -> Option<PathBuf> {
+    let base_dir = app_dir().join("PaddleOCR-json");
+    let names = ["PaddleOCR-json.exe", "PaddleOCR_json.exe"];
+    for name in &names {
+        let p = base_dir.join(name);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(&base_dir) {
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                for name in &names {
+                    let sub_p = path.join(name);
+                    if sub_p.exists() {
+                        return Some(sub_p);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn find_rapid_exe() -> Option<PathBuf> {
+    let base_dir = app_dir().join("RapidOCR-json");
+    let names = ["RapidOCR-json.exe", "RapidOCR_json.exe"];
+    for name in &names {
+        let p = base_dir.join(name);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(&base_dir) {
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                for name in &names {
+                    let sub_p = path.join(name);
+                    if sub_p.exists() {
+                        return Some(sub_p);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn clear_paddle_engine() {
+    PADDLE_OCR_ENGINE.with(|cell| {
+        let mut lock = cell.borrow_mut();
+        if lock.is_some() {
+            runtime_log("[ENGINE] 切换后端，释放 PaddleOCR-json 进程");
+            *lock = None;
+        }
+    });
+}
+
+fn clear_rapid_engine() {
+    RAPID_OCR_ENGINE.with(|cell| {
+        let mut lock = cell.borrow_mut();
+        if lock.is_some() {
+            runtime_log("[ENGINE] 切换后端，释放 RapidOCR-json 进程");
+            *lock = None;
+        }
+    });
+}
+
 thread_local! {
-    static PADDLE_OCR_ENGINE: std::cell::RefCell<Option<pure_onnx_ocr::OcrEngine>> = std::cell::RefCell::new(None);
+    static PADDLE_OCR_ENGINE: std::cell::RefCell<Option<JsonOcrEngine>> = std::cell::RefCell::new(None);
+    static RAPID_OCR_ENGINE: std::cell::RefCell<Option<JsonOcrEngine>> = std::cell::RefCell::new(None);
 }
 
 fn ocr_paddle(bgra: &[u8], width: u32, height: u32) -> Result<String> {
@@ -153,75 +317,110 @@ fn ocr_paddle(bgra: &[u8], width: u32, height: u32) -> Result<String> {
     let res = PADDLE_OCR_ENGINE.with(|cell| {
         let mut lock = cell.borrow_mut();
         if lock.is_none() {
-            let models_dir = app_dir().join("models");
-            let det_path = models_dir.join("det.onnx");
-            let rec_path = models_dir.join("rec.onnx");
-            let dict_path = models_dir.join("ppocr_keys_v1.txt");
-
-            if !det_path.exists() || !rec_path.exists() || !dict_path.exists() {
-                err_opt = Some(anyhow::anyhow!("本地 ONNX 模型文件缺失，请在界面中点击「安装」进行下载。"));
-                return None;
-            }
-
-            match pure_onnx_ocr::OcrEngineBuilder::new()
-                .det_model_path(det_path)
-                .rec_model_path(rec_path)
-                .dictionary_path(dict_path)
-                .build()
-            {
-                Ok(ocr) => {
-                    *lock = Some(ocr);
+            let exe_path = match find_paddle_exe() {
+                Some(p) => p,
+                None => {
+                    err_opt = Some(anyhow::anyhow!("本地 PaddleOCR 引擎未安装。请在界面中点击「安装」。"));
+                    return None;
+                }
+            };
+            
+            match JsonOcrEngine::new(&exe_path) {
+                Ok(engine) => {
+                    *lock = Some(engine);
                 }
                 Err(e) => {
-                    err_opt = Some(anyhow::anyhow!("初始化 PaddleOCR ONNX 引擎失败: {:?}", e));
+                    err_opt = Some(anyhow::anyhow!("启动 PaddleOCR 引擎失败: {:?}", e));
                     return None;
                 }
             }
         }
         
         let engine = lock.as_mut().unwrap();
-
-        let rgba_bytes: Vec<u8> = bgra.chunks_exact(4)
-            .flat_map(|p| [p[2], p[1], p[0], p[3]])
-            .collect();
-
-        let img_buffer = match image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(
-            width,
-            height,
-            rgba_bytes,
-        ) {
-            Some(buf) => buf,
-            None => {
-                err_opt = Some(anyhow::anyhow!("无法从内存字节重构图像缓冲区"));
+        
+        let temp_path = match save_temp_png(bgra, width, height) {
+            Ok(p) => p,
+            Err(e) => {
+                err_opt = Some(e);
                 return None;
             }
         };
-
-        let dynamic_img = image::DynamicImage::ImageRgba8(img_buffer);
         
-        match engine.run_from_image(&dynamic_img) {
-            Ok(results) => {
-                let mut lines = Vec::new();
-                for res in results {
-                    if !res.text.trim().is_empty() {
-                        lines.push(res.text);
-                    }
-                }
-                Some(lines.join("\n"))
-            }
+        let ocr_res = engine.ocr(&temp_path);
+        let _ = std::fs::remove_file(temp_path);
+        
+        match ocr_res {
+            Ok(text) => Some(text),
             Err(e) => {
-                err_opt = Some(anyhow::anyhow!("PaddleOCR 本地推理出错: {:?}", e));
+                *lock = None;
+                err_opt = Some(e);
                 None
             }
         }
     });
-
+    
     if let Some(err) = err_opt {
         Err(err)
     } else {
         Ok(res.unwrap_or_default())
     }
 }
+
+fn ocr_rapid(bgra: &[u8], width: u32, height: u32) -> Result<String> {
+    let mut err_opt = None;
+    
+    let res = RAPID_OCR_ENGINE.with(|cell| {
+        let mut lock = cell.borrow_mut();
+        if lock.is_none() {
+            let exe_path = match find_rapid_exe() {
+                Some(p) => p,
+                None => {
+                    err_opt = Some(anyhow::anyhow!("本地 RapidOCR 引擎未安装。请在界面中点击「安装」。"));
+                    return None;
+                }
+            };
+            
+            match JsonOcrEngine::new(&exe_path) {
+                Ok(engine) => {
+                    *lock = Some(engine);
+                }
+                Err(e) => {
+                    err_opt = Some(anyhow::anyhow!("启动 RapidOCR 引擎失败: {:?}", e));
+                    return None;
+                }
+            }
+        }
+        
+        let engine = lock.as_mut().unwrap();
+        
+        let temp_path = match save_temp_png(bgra, width, height) {
+            Ok(p) => p,
+            Err(e) => {
+                err_opt = Some(e);
+                return None;
+            }
+        };
+        
+        let ocr_res = engine.ocr(&temp_path);
+        let _ = std::fs::remove_file(temp_path);
+        
+        match ocr_res {
+            Ok(text) => Some(text),
+            Err(e) => {
+                *lock = None;
+                err_opt = Some(e);
+                None
+            }
+        }
+    });
+    
+    if let Some(err) = err_opt {
+        Err(err)
+    } else {
+        Ok(res.unwrap_or_default())
+    }
+}
+
 
 // ─── 引擎环境检测与自动安装 ────────────────────────────────
 
@@ -295,11 +494,24 @@ fn ensure_chi_sim() {
 
     // 两处都没有，自动下载到用户目录（无需管理员权限）
     runtime_log("[TESSDATA] chi_sim.traineddata 缺失，正在下载到 ~/.miaocr/tessdata/");
-    let chi_url = "https://github.com/tesseract-ocr/tessdata_fast/raw/main/chi_sim.traineddata";
-    let status = std::process::Command::new("curl")
-        .args(["-L", "-o", user_chi.to_str().unwrap(), chi_url])
-        .status();
-    if status.map(|s| s.success()).unwrap_or(false) {
+    let chi_urls = [
+        "https://mirror.ghproxy.com/https://github.com/tesseract-ocr/tessdata_fast/raw/main/chi_sim.traineddata",
+        "https://ghproxy.net/https://github.com/tesseract-ocr/tessdata_fast/raw/main/chi_sim.traineddata",
+        "https://github.com/tesseract-ocr/tessdata_fast/raw/main/chi_sim.traineddata"
+    ];
+
+    let mut download_success = false;
+    for url in chi_urls {
+        let status = std::process::Command::new("curl")
+            .args(["-k", "-L", "-o", user_chi.to_str().unwrap(), url])
+            .status();
+        if status.map(|s| s.success()).unwrap_or(false) {
+            download_success = true;
+            break;
+        }
+    }
+
+    if download_success {
         runtime_log("[TESSDATA] chi_sim.traineddata 下载完成");
         std::env::set_var("TESSDATA_PREFIX", &user_tessdata);
     } else {
@@ -307,107 +519,188 @@ fn ensure_chi_sim() {
     }
 }
 
-/// 检测本地 PaddleOCR ONNX 相关的模型文件是否存在
+/// 检测本地 PaddleOCR 相关的 exe 文件是否存在
 fn detect_paddle() -> bool {
-    let models_dir = app_dir().join("models");
-    let det_path = models_dir.join("det.onnx");
-    let rec_path = models_dir.join("rec.onnx");
-    let dict_path = models_dir.join("ppocr_keys_v1.txt");
-
-    det_path.exists() && rec_path.exists() && dict_path.exists()
+    find_paddle_exe().is_some()
 }
 
-/// 后台异步下载安装 PaddleOCR ONNX 引擎模型文件
+/// 后台异步下载安装 PaddleOCR-json 引擎
 fn start_paddle_install(state: Arc<Mutex<InstallState>>, ctx: egui::Context) {
-    runtime_log("[INSTALL] PaddleOCR ONNX 下载开始");
+    runtime_log("[INSTALL] PaddleOCR-json 下载开始");
     std::thread::spawn(move || {
         let set = |s: InstallState| {
             *state.lock().unwrap() = s;
             ctx.request_repaint();
         };
 
-        let models_dir = app_dir().join("models");
-        let _ = std::fs::create_dir_all(&models_dir);
+        let dest_dir = app_dir().join("PaddleOCR-json");
+        let zip_path = app_dir().join("PaddleOCR-json.7z");
+        
+        let urls = [
+            "https://mirror.ghproxy.com/https://github.com/hiroi-sora/PaddleOCR-json/releases/download/v1.4.1/PaddleOCR-json_v1.4.1_windows_x64.7z",
+            "https://ghproxy.net/https://github.com/hiroi-sora/PaddleOCR-json/releases/download/v1.4.1/PaddleOCR-json_v1.4.1_windows_x64.7z",
+            "https://github.com/hiroi-sora/PaddleOCR-json/releases/download/v1.4.1/PaddleOCR-json_v1.4.1_windows_x64.7z"
+        ];
 
-        let det_path = models_dir.join("det.onnx");
-        let rec_path = models_dir.join("rec.onnx");
-        let dict_path = models_dir.join("ppocr_keys_v1.txt");
+        if !detect_paddle() {
+            let mut download_success = false;
+            let mut last_error_msg = String::new();
 
-        let det_url = "https://modelscope.cn/api/v1/models/RapidAI/RapidOCR/repo?FilePath=onnx/PP-OCRv4/det/ch_PP-OCRv4_det_mobile.onnx";
-        let rec_url = "https://modelscope.cn/api/v1/models/RapidAI/RapidOCR/repo?FilePath=onnx/PP-OCRv4/rec/ch_PP-OCRv4_rec_mobile.onnx";
-        let dict_url = "https://gitee.com/paddlepaddle/PaddleOCR/raw/release/2.7/ppocr/utils/ppocr_keys_v1.txt";
-
-        // 1. 下载文字检测模型 det.onnx
-        if !det_path.exists() {
-            set(InstallState::Installing("正在下载检测模型 det.onnx (约 4.5 MB)...".into()));
-            let status = std::process::Command::new("curl")
-                .args(["-L", "--connect-timeout", "15", "--retry", "3", "-o", det_path.to_str().unwrap(), det_url])
-                .status();
-            match status {
-                Ok(s) if s.success() => {}
-                Ok(s) => {
-                    let err = format!("下载检测模型失败 (exit {})。请检查代理或手动下载放入 ~/.miaocr/models/ 目录，地址: {}", s, det_url);
-                    runtime_log(&err);
-                    set(InstallState::Failed(err));
-                    return;
-                }
-                Err(e) => {
-                    let err = format!("启动 curl 下载检测模型失败: {}。请手动下载放入 ~/.miaocr/models/ 目录，地址: {}", e, det_url);
-                    runtime_log(&err);
-                    set(InstallState::Failed(err));
-                    return;
-                }
-            }
-        }
-
-        // 2. 下载文字识别模型 rec.onnx
-        if !rec_path.exists() {
-            set(InstallState::Installing("正在下载识别模型 rec.onnx (约 10 MB)...".into()));
-            let status = std::process::Command::new("curl")
-                .args(["-L", "--connect-timeout", "15", "--retry", "3", "-o", rec_path.to_str().unwrap(), rec_url])
-                .status();
-            match status {
-                Ok(s) if s.success() => {}
-                Ok(s) => {
-                    let err = format!("下载识别模型失败 (exit {})。请检查代理或手动下载放入 ~/.miaocr/models/ 目录，地址: {}", s, rec_url);
-                    runtime_log(&err);
-                    set(InstallState::Failed(err));
-                    return;
-                }
-                Err(e) => {
-                    let err = format!("启动 curl 下载识别模型失败: {}。请手动下载放入 ~/.miaocr/models/ 目录，地址: {}", e, rec_url);
-                    runtime_log(&err);
-                    set(InstallState::Failed(err));
-                    return;
+            for (idx, url) in urls.iter().enumerate() {
+                let msg = format!("正在下载 PaddleOCR-json 引擎 (源 {}/{}，约 98 MB)...", idx + 1, urls.len());
+                set(InstallState::Installing(msg));
+                
+                runtime_log(&format!("[INSTALL] 尝试自源 {} 下载: {}", idx + 1, url));
+                let status = std::process::Command::new("curl")
+                    .args(["-k", "-L", "--connect-timeout", "30", "--retry", "2", "-o", zip_path.to_str().unwrap(), url])
+                    .status();
+                
+                match status {
+                    Ok(s) if s.success() => {
+                        download_success = true;
+                        break;
+                    }
+                    Ok(s) => {
+                        last_error_msg = format!("退出码 {}", s);
+                        runtime_log(&format!("[INSTALL] 源 {} 下载失败: {}", idx + 1, last_error_msg));
+                    }
+                    Err(e) => {
+                        last_error_msg = format!("启动失败: {}", e);
+                        runtime_log(&format!("[INSTALL] 无法启动 curl (源 {}): {}", idx + 1, last_error_msg));
+                    }
                 }
             }
-        }
 
-        // 3. 下载中文字典文件 ppocr_keys_v1.txt
-        if !dict_path.exists() {
-            set(InstallState::Installing("正在下载中文字典 ppocr_keys_v1.txt...".into()));
-            let status = std::process::Command::new("curl")
-                .args(["-L", "--connect-timeout", "15", "--retry", "3", "-o", dict_path.to_str().unwrap(), dict_url])
-                .status();
-            match status {
-                Ok(s) if s.success() => {}
-                Ok(s) => {
-                    let err = format!("下载字典文件失败 (exit {})。请检查代理或手动下载放入 ~/.miaocr/models/ 目录，地址: {}", s, dict_url);
-                    runtime_log(&err);
-                    set(InstallState::Failed(err));
-                    return;
+            if !download_success {
+                let err = format!(
+                    "下载 PaddleOCR-json 失败 ({})。请检查网络或代理，或者手动下载并解压到 ~/.miaocr/PaddleOCR-json/ 目录，下载地址: {}",
+                    last_error_msg, urls[0]
+                );
+                set(InstallState::Failed(err));
+                return;
+            }
+
+            set(InstallState::Installing("正在解压 PaddleOCR-json 引擎...".into()));
+            if dest_dir.exists() {
+                let _ = std::fs::remove_dir_all(&dest_dir);
+            }
+            let _ = std::fs::create_dir_all(&dest_dir);
+
+            match sevenz_rust::decompress_file(&zip_path, &dest_dir) {
+                Ok(_) => {
+                    let _ = std::fs::remove_file(&zip_path);
+                    if detect_paddle() {
+                        runtime_log("[INSTALL] PaddleOCR-json 安装完成");
+                        set(InstallState::Available);
+                    } else {
+                        let err = "解压完成，但未在目标目录中找到 PaddleOCR_json.exe 可执行文件。".to_string();
+                        runtime_log(&err);
+                        set(InstallState::Failed(err));
+                    }
                 }
                 Err(e) => {
-                    let err = format!("启动 curl 下载字典文件失败: {}。请手动下载放入 ~/.miaocr/models/ 目录，地址: {}", e, dict_url);
+                    let _ = std::fs::remove_file(&zip_path);
+                    let err = format!("解压 PaddleOCR-json 失败: {}", e);
                     runtime_log(&err);
                     set(InstallState::Failed(err));
-                    return;
                 }
             }
+        } else {
+            set(InstallState::Available);
         }
+    });
+}
 
-        runtime_log("[INSTALL] PaddleOCR ONNX 下载完成");
-        set(InstallState::Available);
+
+/// 检测本地 RapidOCR 相关的 exe 文件是否存在
+fn detect_rapid() -> bool {
+    find_rapid_exe().is_some()
+}
+
+/// 后台异步下载安装 RapidOCR-json 引擎
+fn start_rapid_install(state: Arc<Mutex<InstallState>>, ctx: egui::Context) {
+    runtime_log("[INSTALL] RapidOCR-json 下载开始");
+    std::thread::spawn(move || {
+        let set = |s: InstallState| {
+            *state.lock().unwrap() = s;
+            ctx.request_repaint();
+        };
+
+        let dest_dir = app_dir().join("RapidOCR-json");
+        let zip_path = app_dir().join("RapidOCR-json.7z");
+        
+        let urls = [
+            "https://mirror.ghproxy.com/https://github.com/hiroi-sora/RapidOCR-json/releases/download/v0.2.0/RapidOCR-json_v0.2.0.7z",
+            "https://ghproxy.net/https://github.com/hiroi-sora/RapidOCR-json/releases/download/v0.2.0/RapidOCR-json_v0.2.0.7z",
+            "https://github.com/hiroi-sora/RapidOCR-json/releases/download/v0.2.0/RapidOCR-json_v0.2.0.7z"
+        ];
+
+        if !detect_rapid() {
+            let mut download_success = false;
+            let mut last_error_msg = String::new();
+
+            for (idx, url) in urls.iter().enumerate() {
+                let msg = format!("正在下载 RapidOCR-json 引擎 (源 {}/{}，约 15 MB)...", idx + 1, urls.len());
+                set(InstallState::Installing(msg));
+                
+                runtime_log(&format!("[INSTALL] 尝试自源 {} 下载: {}", idx + 1, url));
+                let status = std::process::Command::new("curl")
+                    .args(["-k", "-L", "--connect-timeout", "30", "--retry", "2", "-o", zip_path.to_str().unwrap(), url])
+                    .status();
+                
+                match status {
+                    Ok(s) if s.success() => {
+                        download_success = true;
+                        break;
+                    }
+                    Ok(s) => {
+                        last_error_msg = format!("退出码 {}", s);
+                        runtime_log(&format!("[INSTALL] 源 {} 下载失败: {}", idx + 1, last_error_msg));
+                    }
+                    Err(e) => {
+                        last_error_msg = format!("启动失败: {}", e);
+                        runtime_log(&format!("[INSTALL] 无法启动 curl (源 {}): {}", idx + 1, last_error_msg));
+                    }
+                }
+            }
+
+            if !download_success {
+                let err = format!(
+                    "下载 RapidOCR-json 失败 ({})。请检查网络或代理，或者手动下载并解压到 ~/.miaocr/RapidOCR-json/ 目录，下载地址: {}",
+                    last_error_msg, urls[0]
+                );
+                set(InstallState::Failed(err));
+                return;
+            }
+
+            set(InstallState::Installing("正在解压 RapidOCR-json 引擎...".into()));
+            if dest_dir.exists() {
+                let _ = std::fs::remove_dir_all(&dest_dir);
+            }
+            let _ = std::fs::create_dir_all(&dest_dir);
+
+            match sevenz_rust::decompress_file(&zip_path, &dest_dir) {
+                Ok(_) => {
+                    let _ = std::fs::remove_file(&zip_path);
+                    if detect_rapid() {
+                        runtime_log("[INSTALL] RapidOCR-json 安装完成");
+                        set(InstallState::Available);
+                    } else {
+                        let err = "解压完成，但未在目标目录中找到 RapidOCR_json.exe 可执行文件。".to_string();
+                        runtime_log(&err);
+                        set(InstallState::Failed(err));
+                    }
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_file(&zip_path);
+                    let err = format!("解压 RapidOCR-json 失败: {}", e);
+                    runtime_log(&err);
+                    set(InstallState::Failed(err));
+                }
+            }
+        } else {
+            set(InstallState::Available);
+        }
     });
 }
 
@@ -427,7 +720,7 @@ fn start_tesseract_install(state: Arc<Mutex<InstallState>>, ctx: egui::Context) 
         set(InstallState::Installing("正在获取最新版本信息...".into()));
         let installer_url: String = {
             let api_out = std::process::Command::new("curl")
-                .args(["-s", "-L",
+                .args(["-k", "-s", "-L",
                        "-H", "Accept: application/vnd.github+json",
                        "-H", "User-Agent: miaocr",
                        "https://api.github.com/repos/UB-Mannheim/tesseract/releases/latest"])
@@ -460,26 +753,48 @@ fn start_tesseract_install(state: Arc<Mutex<InstallState>>, ctx: egui::Context) 
         // ── 步骤 2：下载安装包到临时目录（普通权限即可）──────────
         let temp_installer = temp_dir.join("miaocr_tesseract_setup.exe");
         set(InstallState::Installing("正在下载 Tesseract 安装包（约 50 MB）...".into()));
-        let dl1 = std::process::Command::new("curl")
-            .args(["-L", "-o", temp_installer.to_str().unwrap(), &installer_url])
-            .status();
-        match dl1 {
-            Ok(s) if s.success() => {}
-            Ok(s) => { set(InstallState::Failed(format!("安装包下载失败（exit {}），请检查网络", s))); return; }
-            Err(e) => { set(InstallState::Failed(format!("安装包下载失败: {}", e))); return; }
+        let dl1_urls = [
+            installer_url.replace("https://github.com/", "https://mirror.ghproxy.com/https://github.com/"),
+            installer_url.replace("https://github.com/", "https://ghproxy.net/https://github.com/"),
+            installer_url.clone()
+        ];
+        let mut dl1_success = false;
+        for url in &dl1_urls {
+            let status = std::process::Command::new("curl")
+                .args(["-k", "-L", "-o", temp_installer.to_str().unwrap(), url])
+                .status();
+            if status.map(|s| s.success()).unwrap_or(false) {
+                dl1_success = true;
+                break;
+            }
+        }
+        if !dl1_success {
+            set(InstallState::Failed("安装包下载失败，请检查网络".into()));
+            return;
         }
 
         // ── 步骤 3：下载 chi_sim 中文训练数据到临时目录 ──────────
         let temp_chi = temp_dir.join("miaocr_chi_sim.traineddata");
         set(InstallState::Installing("正在下载中文语言包（chi_sim，约 20 MB）...".into()));
         let chi_url = "https://github.com/tesseract-ocr/tessdata_fast/raw/main/chi_sim.traineddata";
-        let dl2 = std::process::Command::new("curl")
-            .args(["-L", "-o", temp_chi.to_str().unwrap(), chi_url])
-            .status();
-        match dl2 {
-            Ok(s) if s.success() => {}
-            Ok(s) => { set(InstallState::Failed(format!("中文语言包下载失败（exit {}），请检查网络", s))); return; }
-            Err(e) => { set(InstallState::Failed(format!("中文语言包下载失败: {}", e))); return; }
+        let dl2_urls = [
+            chi_url.replace("https://github.com/", "https://mirror.ghproxy.com/https://github.com/"),
+            chi_url.replace("https://github.com/", "https://ghproxy.net/https://github.com/"),
+            chi_url.to_string()
+        ];
+        let mut dl2_success = false;
+        for url in &dl2_urls {
+            let status = std::process::Command::new("curl")
+                .args(["-k", "-L", "-o", temp_chi.to_str().unwrap(), url])
+                .status();
+            if status.map(|s| s.success()).unwrap_or(false) {
+                dl2_success = true;
+                break;
+            }
+        }
+        if !dl2_success {
+            set(InstallState::Failed("中文语言包下载失败，请检查网络".into()));
+            return;
         }
 
         // ── 步骤 4：生成 PowerShell 安装脚本 ─────────────────────
@@ -720,8 +1035,17 @@ fn ocr_region(
         (bgra_bytes, image.width(), image.height())
     };
 
-    // 应用二值化与智能反色算法预处理图片，去除抗锯齿杂色并将背景归一化为纯白底黑字
-    binarize_bgra(&mut bgra);
+    // 仅对 WindowsNative 和 Tesseract 应用二值化预处理（PaddleOCR 等深度学习模型直接基于原图推理效果更好）
+    if backend == BackendType::WindowsNative || backend == BackendType::Tesseract {
+        binarize_bgra(&mut bgra);
+    }
+
+    if backend != BackendType::PaddleOcr {
+        clear_paddle_engine();
+    }
+    if backend != BackendType::RapidOcr {
+        clear_rapid_engine();
+    }
 
     match backend {
         BackendType::WindowsNative => {
@@ -813,6 +1137,16 @@ fn ocr_region(
                 .join("\n");
             Ok(clean)
         }
+        BackendType::RapidOcr => {
+            let text = ocr_rapid(&bgra, final_width, final_height)?;
+            let clean: String = text
+                .lines()
+                .map(|l: &str| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(clean)
+        }
         BackendType::CloudApi => {
             let text = ocr_api(&bgra, final_width, final_height, api_url)?;
             Ok(text)
@@ -857,6 +1191,7 @@ enum BackendType {
     MacNative,
     Tesseract,
     PaddleOcr,
+    RapidOcr,
     CloudApi,
 }
 
@@ -867,6 +1202,7 @@ impl BackendType {
             BackendType::MacNative     => "macOS 原生",
             BackendType::Tesseract    => "Tesseract (本地)",
             BackendType::PaddleOcr   => "PaddleOCR (本地)",
+            BackendType::RapidOcr    => "RapidOCR (本地)",
             BackendType::CloudApi    => "自定义 API",
         }
     }
@@ -906,6 +1242,7 @@ struct FloatApp {
     // 引擎安装状态（后台检测 / 安装线程写入）
     tess_state:   Arc<Mutex<InstallState>>,
     paddle_state: Arc<Mutex<InstallState>>,
+    rapid_state:  Arc<Mutex<InstallState>>,
 
     // 折叠展开状态
     expanded: bool,
@@ -1238,6 +1575,7 @@ impl eframe::App for FloatApp {
                                         ui.selectable_value(&mut current_backend, BackendType::MacNative, "macOS 原生");
                                         ui.selectable_value(&mut current_backend, BackendType::Tesseract,    "Tesseract");
                                         ui.selectable_value(&mut current_backend, BackendType::PaddleOcr,    "PaddleOCR");
+                                        ui.selectable_value(&mut current_backend, BackendType::RapidOcr,     "RapidOCR");
                                         ui.selectable_value(&mut current_backend, BackendType::CloudApi,     "自定义 API");
                                     });
                                 if current_backend != prev_backend {
@@ -1250,92 +1588,121 @@ impl eframe::App for FloatApp {
                                         BackendType::PaddleOcr => {
                                             *self.paddle_state.lock().unwrap() == InstallState::Unchecked
                                         }
+                                        BackendType::RapidOcr => {
+                                            *self.rapid_state.lock().unwrap() == InstallState::Unchecked
+                                        }
                                         _ => false,
                                     };
                                     if need_check {
                                         let (state_arc, ctx_clone) = match current_backend {
                                             BackendType::Tesseract => (self.tess_state.clone(), ui.ctx().clone()),
-                                            _ => (self.paddle_state.clone(), ui.ctx().clone()),
+                                            BackendType::PaddleOcr => (self.paddle_state.clone(), ui.ctx().clone()),
+                                            _ => (self.rapid_state.clone(), ui.ctx().clone()),
                                         };
                                         *state_arc.lock().unwrap() = InstallState::Checking;
-                                        let is_tess = current_backend == BackendType::Tesseract;
+                                        let b_type = current_backend;
                                         std::thread::spawn(move || {
-                                            let available = if is_tess { detect_tesseract() } else { detect_paddle() };
+                                            let available = match b_type {
+                                                BackendType::Tesseract => detect_tesseract(),
+                                                BackendType::PaddleOcr => detect_paddle(),
+                                                _ => detect_rapid(),
+                                            };
                                             *state_arc.lock().unwrap() = if available {
                                                 InstallState::Available
-                                            } else {
+                                             } else {
                                                 InstallState::NotInstalled
-                                            };
-                                            ctx_clone.request_repaint();
+                                             };
+                                             ctx_clone.request_repaint();
                                         });
                                     }
                                 }
-
-                                // ── 引擎状态 badge（仅 Tesseract / PaddleOCR 显示）──
+ 
+                                // ── 引擎状态 badge（仅 Tesseract / PaddleOCR / RapidOCR 显示）──
                                 let engine_state = match current_backend {
                                     BackendType::Tesseract => Some(self.tess_state.lock().unwrap().clone()),
                                     BackendType::PaddleOcr => Some(self.paddle_state.lock().unwrap().clone()),
+                                    BackendType::RapidOcr  => Some(self.rapid_state.lock().unwrap().clone()),
                                     _ => None,
                                 };
                                 if let Some(state) = engine_state {
                                     match &state {
-                                        InstallState::Unchecked => {
-                                            ui.label(egui::RichText::new("?").size(10.0).color(egui::Color32::GRAY));
-                                        }
-                                        InstallState::Checking => {
-                                            ui.label(egui::RichText::new("检测中").size(10.0).color(egui::Color32::YELLOW));
-                                        }
-                                        InstallState::Available => {
-                                            ui.label(egui::RichText::new("✓").size(11.0).color(egui::Color32::GREEN));
-                                        }
-                                        InstallState::NotInstalled => {
-                                            ui.label(egui::RichText::new("✗").size(11.0).color(egui::Color32::RED));
-                                            if ui.small_button("安装").clicked() {
-                                                if current_backend == BackendType::Tesseract {
-                                                    start_tesseract_install(
-                                                        self.tess_state.clone(),
-                                                        ui.ctx().clone(),
-                                                    );
-                                                } else if current_backend == BackendType::PaddleOcr {
-                                                    start_paddle_install(
-                                                        self.paddle_state.clone(),
-                                                        ui.ctx().clone(),
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        InstallState::Installing(msg) => {
-                                            ui.label(
-                                                egui::RichText::new(format!("⏳ {}", msg))
-                                                    .size(10.0)
-                                                    .color(egui::Color32::from_rgb(255, 200, 50)),
-                                            );
-                                        }
-                                        InstallState::Failed(err) => {
-                                            let short = if err.chars().count() > 12 {
-                                                format!("{}…", &err.chars().take(12).collect::<String>())
-                                            } else {
-                                                err.clone()
-                                            };
-                                            ui.label(
-                                                egui::RichText::new(format!("✗ {}", short))
-                                                    .size(10.0)
-                                                    .color(egui::Color32::RED),
-                                            ).on_hover_text(err.as_str());
-                                            if ui.small_button("重试").clicked() {
-                                                if current_backend == BackendType::Tesseract {
-                                                    start_tesseract_install(
-                                                        self.tess_state.clone(),
-                                                        ui.ctx().clone(),
-                                                    );
-                                                } else if current_backend == BackendType::PaddleOcr {
-                                                    start_paddle_install(
-                                                        self.paddle_state.clone(),
-                                                        ui.ctx().clone(),
-                                                    );
-                                                }
-                                            }
-                                        }
+                                         InstallState::Unchecked => {
+                                             ui.label(egui::RichText::new("?").size(10.0).color(egui::Color32::GRAY));
+                                         }
+                                         InstallState::Checking => {
+                                             ui.label(egui::RichText::new("检测中").size(10.0).color(egui::Color32::YELLOW));
+                                         }
+                                         InstallState::Available => {
+                                             ui.label(egui::RichText::new("✓").size(11.0).color(egui::Color32::GREEN));
+                                         }
+                                         InstallState::NotInstalled => {
+                                             ui.label(egui::RichText::new("✗").size(11.0).color(egui::Color32::RED));
+                                             if ui.small_button("安装").clicked() {
+                                                 match current_backend {
+                                                     BackendType::Tesseract => {
+                                                         start_tesseract_install(
+                                                             self.tess_state.clone(),
+                                                             ui.ctx().clone(),
+                                                         );
+                                                     }
+                                                     BackendType::PaddleOcr => {
+                                                         start_paddle_install(
+                                                             self.paddle_state.clone(),
+                                                             ui.ctx().clone(),
+                                                         );
+                                                     }
+                                                     BackendType::RapidOcr => {
+                                                         start_rapid_install(
+                                                             self.rapid_state.clone(),
+                                                             ui.ctx().clone(),
+                                                         );
+                                                     }
+                                                     _ => {}
+                                                 }
+                                             }
+                                         }
+                                         InstallState::Installing(msg) => {
+                                             ui.label(
+                                                 egui::RichText::new(format!("⏳ {}", msg))
+                                                     .size(10.0)
+                                                     .color(egui::Color32::from_rgb(255, 200, 50)),
+                                             );
+                                         }
+                                         InstallState::Failed(err) => {
+                                             let short = if err.chars().count() > 12 {
+                                                 format!("{}…", &err.chars().take(12).collect::<String>())
+                                             } else {
+                                                 err.clone()
+                                             };
+                                             ui.label(
+                                                 egui::RichText::new(format!("✗ {}", short))
+                                                     .size(10.0)
+                                                     .color(egui::Color32::RED),
+                                             ).on_hover_text(err.as_str());
+                                             if ui.small_button("重试").clicked() {
+                                                 match current_backend {
+                                                     BackendType::Tesseract => {
+                                                         start_tesseract_install(
+                                                             self.tess_state.clone(),
+                                                             ui.ctx().clone(),
+                                                         );
+                                                     }
+                                                     BackendType::PaddleOcr => {
+                                                         start_paddle_install(
+                                                             self.paddle_state.clone(),
+                                                             ui.ctx().clone(),
+                                                         );
+                                                     }
+                                                     BackendType::RapidOcr => {
+                                                         start_rapid_install(
+                                                             self.rapid_state.clone(),
+                                                             ui.ctx().clone(),
+                                                         );
+                                                     }
+                                                     _ => {}
+                                                 }
+                                             }
+                                         }
                                     }
                                 }
 
@@ -1530,6 +1897,7 @@ fn main() -> Result<()> {
     // 引擎安装状态（默认 Unchecked，启动后台线程完成初始检测）
     let shared_tess_state   = Arc::new(Mutex::new(InstallState::Unchecked));
     let shared_paddle_state = Arc::new(Mutex::new(InstallState::Unchecked));
+    let shared_rapid_state  = Arc::new(Mutex::new(InstallState::Unchecked));
 
     // 2. 设定无边框、始终置顶且支持透明背景的悬浮胶囊参数
     let options = eframe::NativeOptions {
@@ -1589,13 +1957,14 @@ fn main() -> Result<()> {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
             runtime_log("=== miaocr 启动 ===");
 
-            // 3. 启动引擎环境初始检测线程（启动时静默检测 Tesseract / PaddleOCR）
+            // 3. 启动引擎环境初始检测线程（启动时静默检测 Tesseract / PaddleOCR / RapidOCR）
             {
                 let tess_state   = shared_tess_state.clone();
                 let paddle_state = shared_paddle_state.clone();
+                let rapid_state  = shared_rapid_state.clone();
                 let ctx_detect = cc.egui_ctx.clone();
                 std::thread::spawn(move || {
-                    // 并发检测两个引擎
+                    // 并发检测三个引擎
                     let t1 = {
                         let ts = tess_state.clone();
                         let c  = ctx_detect.clone();
@@ -1622,8 +1991,22 @@ fn main() -> Result<()> {
                             c.request_repaint();
                         })
                     };
+                    let t3 = {
+                        let rs = rapid_state.clone();
+                        let c  = ctx_detect.clone();
+                        std::thread::spawn(move || {
+                            *rs.lock().unwrap() = InstallState::Checking;
+                            c.request_repaint();
+                            let avail = detect_rapid();
+                            runtime_log(&format!("[DETECT] RapidOCR: {}",
+                                if avail { "已安装" } else { "未安装" }));
+                            *rs.lock().unwrap() = if avail { InstallState::Available } else { InstallState::NotInstalled };
+                            c.request_repaint();
+                        })
+                    };
                     let _ = t1.join();
                     let _ = t2.join();
+                    let _ = t3.join();
                 });
             }
 
@@ -1681,12 +2064,12 @@ fn main() -> Result<()> {
                         }
                     }
 
-                    // 动态决定下一次识别的休眠时间（取最近 10 次的最大耗时，辅以 50ms 下限及 3000ms 上限保护）
+                    // 动态决定下一次识别的休眠时间（取最近 10 次的最大耗时，辅以 50ms 下限保护，取消上限限制）
                     let sleep_ms = if history.is_empty() {
                         1000
                     } else {
                         let max_elapsed = *history.iter().max().unwrap_or(&0);
-                        max_elapsed.max(50).min(3000)
+                        max_elapsed.max(50)
                     };
 
                     *interval_for_thread.lock().unwrap() = sleep_ms as u128;
@@ -1711,6 +2094,7 @@ fn main() -> Result<()> {
                 api_url: shared_api_url,
                 tess_state:   shared_tess_state,
                 paddle_state: shared_paddle_state,
+                rapid_state:  shared_rapid_state,
                 expanded: false,
                 screenshot_texture: None,
                 screenshot_raw: Vec::new(),
