@@ -1719,7 +1719,7 @@ impl eframe::App for FloatApp {
             // 半透明暗色卡片风格（内容区域使用，窗口本身使用系统标题栏）
             let card_frame = egui::Frame::none()
                 .fill(egui::Color32::from_rgba_unmultiplied(20, 20, 25, 230))
-                .inner_margin(egui::Margin::symmetric(10.0, 10.0));
+                .inner_margin(egui::Margin::symmetric(12.0, 10.0));
 
             egui::CentralPanel::default()
                 .frame(card_frame)
@@ -1727,8 +1727,8 @@ impl eframe::App for FloatApp {
                     ui.vertical(|ui| {
                         // ── 顶部操作栏 ──
                         ui.horizontal(|ui| {
-                            // 选区按钮 (带漂亮图标和背景)
-                            let sel_btn = ui.button("🎯 选区");
+                            // 选区按钮 (虚线选框图标)
+                            let sel_btn = ui.button("⛶ 选区");
                             if sel_btn.clicked() {
                                 if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
                                     if rect.min.x > -9000.0 && rect.min.y > -9000.0 {
@@ -1745,7 +1745,7 @@ impl eframe::App for FloatApp {
                             let has_region = self.ocr_region.lock().unwrap().is_some();
                             if has_region {
                                 let is_paused = *self.paused.lock().unwrap();
-                                let play_pause_btn = if is_paused { "▶ 继续" } else { "⏸ 暂停" };
+                                let play_pause_btn = if is_paused { "▶ 继续" } else { "▶I 暂停" };
                                 let btn_res = ui.button(play_pause_btn);
                                 if btn_res.clicked() {
                                     let mut p = self.paused.lock().unwrap();
@@ -1754,24 +1754,35 @@ impl eframe::App for FloatApp {
                                 btn_res.on_hover_text(if is_paused { "继续识别" } else { "暂停识别" });
                             }
 
-                            // 复制按钮
+                            // 耗时与间隔时钟显示 (右对齐)
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let text = self.text.lock().unwrap().clone();
-                                let copy_btn = ui.button("📋 复制");
-                                if copy_btn.clicked() {
-                                    ui.output_mut(|o| o.copied_text = text);
+                                let ms = *self.elapsed.lock().unwrap();
+                                let interval = *self.interval.lock().unwrap();
+                                if ms > 0 {
+                                    ui.label(
+                                        egui::RichText::new(format!("🕒 {}ms / {}ms", ms, interval))
+                                            .color(egui::Color32::from_rgb(156, 163, 175))
+                                            .size(11.0),
+                                    );
                                 }
-                                copy_btn.on_hover_text("复制识别结果到剪贴板");
                             });
                         });
 
-                        ui.add_space(4.0);
-                        ui.separator();
-                        ui.add_space(4.0);
+                        ui.add_space(6.0);
+                        // 极细的半透明白色分割线
+                        let stroke_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 15);
+                        let cursor_y = ui.cursor().min.y;
+                        let width = ui.available_width();
+                        ui.painter().hline(
+                            ui.cursor().min.x..=(ui.cursor().min.x + width),
+                            cursor_y,
+                            egui::Stroke::new(1.0, stroke_color),
+                        );
+                        ui.add_space(8.0);
 
                         // ── 引擎选择及状态行 ──
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("⚙️ 引擎:").size(12.0).color(egui::Color32::from_rgb(156, 163, 175)));
+                            ui.label(egui::RichText::new("引擎:").size(13.0).color(egui::Color32::from_rgb(240, 240, 245)));
                             let mut current_backend = *self.selected_backend.lock().unwrap();
                             let prev_backend = current_backend;
                             
@@ -1832,7 +1843,7 @@ impl eframe::App for FloatApp {
                                 }
                             }
 
-                            // 引擎状态 badge
+                            // 引擎状态指示灯与文字
                             let engine_state = match current_backend {
                                 BackendType::Tesseract => Some(self.tess_state.lock().unwrap().clone()),
                                 BackendType::PaddleOcr => Some(self.paddle_state.lock().unwrap().clone()),
@@ -1843,17 +1854,38 @@ impl eframe::App for FloatApp {
                             if let Some(state) = engine_state {
                                 match &state {
                                     InstallState::Unchecked => {
-                                        ui.label(egui::RichText::new("?").size(11.0).color(egui::Color32::GRAY));
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 4.0;
+                                            let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                                            ui.painter().rect_filled(rect, 2.0, egui::Color32::GRAY);
+                                            ui.label(egui::RichText::new("未检测").size(12.0).color(egui::Color32::GRAY));
+                                        });
                                     }
                                     InstallState::Checking => {
-                                        ui.label(egui::RichText::new("⏳ 检测中").size(11.0).color(egui::Color32::from_rgb(250, 204, 21)));
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 4.0;
+                                            let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                                            ui.painter().rect_filled(rect, 2.0, egui::Color32::from_rgb(250, 204, 21));
+                                            ui.label(egui::RichText::new("检测中").size(12.0).color(egui::Color32::from_rgb(250, 204, 21)));
+                                        });
                                     }
                                     InstallState::Available => {
-                                        ui.label(egui::RichText::new("✓ 已安装").size(11.0).color(egui::Color32::from_rgb(74, 222, 128)));
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 5.0;
+                                            let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                                            // 稍微偏移一点以居中对齐
+                                            let aligned_rect = rect.translate(egui::vec2(0.0, 1.0));
+                                            ui.painter().rect_filled(aligned_rect, 2.0, egui::Color32::from_rgb(34, 197, 94)); // 亮绿
+                                            ui.label(egui::RichText::new("已安装").size(12.0).color(egui::Color32::from_rgb(74, 222, 128)));
+                                        });
                                     }
                                     InstallState::NotInstalled => {
                                         ui.horizontal(|ui| {
-                                            ui.label(egui::RichText::new("✗ 未安装").size(11.0).color(egui::Color32::from_rgb(248, 113, 113)));
+                                            ui.spacing_mut().item_spacing.x = 4.0;
+                                            let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                                            let aligned_rect = rect.translate(egui::vec2(0.0, 1.0));
+                                            ui.painter().rect_filled(aligned_rect, 2.0, egui::Color32::from_rgb(248, 113, 113)); // 亮红
+                                            ui.label(egui::RichText::new("未安装").size(12.0).color(egui::Color32::from_rgb(248, 113, 113)));
                                             if ui.small_button("安装").clicked() {
                                                 match current_backend {
                                                     BackendType::Tesseract => start_tesseract_install(self.tess_state.clone(), ui.ctx().clone()),
@@ -1865,16 +1897,25 @@ impl eframe::App for FloatApp {
                                         });
                                     }
                                     InstallState::Installing(msg) => {
-                                        ui.label(egui::RichText::new(format!("⏳ {}", msg)).size(11.0).color(egui::Color32::from_rgb(250, 204, 21)));
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 4.0;
+                                            let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                                            ui.painter().rect_filled(rect, 2.0, egui::Color32::from_rgb(250, 204, 21));
+                                            ui.label(egui::RichText::new(format!("⏳ {}", msg)).size(12.0).color(egui::Color32::from_rgb(250, 204, 21)));
+                                        });
                                     }
                                     InstallState::Failed(err) => {
                                         ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 4.0;
+                                            let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                                            let aligned_rect = rect.translate(egui::vec2(0.0, 1.0));
+                                            ui.painter().rect_filled(aligned_rect, 2.0, egui::Color32::from_rgb(248, 113, 113));
                                             let short = if err.chars().count() > 10 {
                                                 format!("{}…", &err.chars().take(10).collect::<String>())
                                             } else {
                                                 err.clone()
                                             };
-                                            ui.label(egui::RichText::new(format!("✗ 安装失败 ({})", short)).size(11.0).color(egui::Color32::from_rgb(248, 113, 113)))
+                                            ui.label(egui::RichText::new(format!("安装失败 ({})", short)).size(12.0).color(egui::Color32::from_rgb(248, 113, 113)))
                                                 .on_hover_text(err.as_str());
                                             if ui.small_button("重试").clicked() {
                                                 match current_backend {
@@ -1889,17 +1930,14 @@ impl eframe::App for FloatApp {
                                 }
                             }
 
-                            // 耗时与间隔显示 (右对齐)
+                            // 复制按钮
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let ms = *self.elapsed.lock().unwrap();
-                                let interval = *self.interval.lock().unwrap();
-                                if ms > 0 {
-                                    ui.label(
-                                        egui::RichText::new(format!("⚡ {}ms / {}ms", ms, interval))
-                                            .color(egui::Color32::from_rgb(156, 163, 175))
-                                            .size(10.0),
-                                    );
+                                let text = self.text.lock().unwrap().clone();
+                                let copy_btn = ui.button("📋 复制");
+                                if copy_btn.clicked() {
+                                    ui.output_mut(|o| o.copied_text = text);
                                 }
+                                copy_btn.on_hover_text("复制识别结果到剪贴板");
                             });
                         });
 
@@ -2223,17 +2261,42 @@ fn main() -> Result<()> {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
             cc.egui_ctx.style_mut(|style| {
                 style.visuals.window_rounding = 8.0.into();
-                style.visuals.widgets.noninteractive.rounding = 6.0.into();
-                style.visuals.widgets.inactive.rounding = 6.0.into();
-                style.visuals.widgets.hovered.rounding = 6.0.into();
-                style.visuals.widgets.active.rounding = 6.0.into();
-                style.visuals.widgets.open.rounding = 6.0.into();
                 
+                let border_color_inactive = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 25);
+                let border_color_hovered = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 50);
+                let border_color_active = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 75);
+                
+                let bg_color_inactive = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 12);
+                let bg_color_hovered = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 25);
+                let bg_color_active = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 35);
+                
+                style.visuals.widgets.inactive.bg_fill = bg_color_inactive;
+                style.visuals.widgets.inactive.weak_bg_fill = bg_color_inactive;
+                style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, border_color_inactive);
+                style.visuals.widgets.inactive.rounding = egui::Rounding::same(6.0);
+                style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(220, 220, 225));
+                
+                style.visuals.widgets.hovered.bg_fill = bg_color_hovered;
+                style.visuals.widgets.hovered.weak_bg_fill = bg_color_hovered;
+                style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, border_color_hovered);
+                style.visuals.widgets.hovered.rounding = egui::Rounding::same(6.0);
+                style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+                
+                style.visuals.widgets.active.bg_fill = bg_color_active;
+                style.visuals.widgets.active.weak_bg_fill = bg_color_active;
+                style.visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, border_color_active);
+                style.visuals.widgets.active.rounding = egui::Rounding::same(6.0);
+                style.visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+
+                style.visuals.widgets.open.rounding = egui::Rounding::same(6.0);
+                style.visuals.widgets.open.bg_fill = egui::Color32::from_rgb(30, 30, 35);
+                style.visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0, border_color_inactive);
+
                 style.visuals.selection.bg_fill = egui::Color32::from_rgb(59, 130, 246); // Brand blue
                 style.visuals.hyperlink_color = egui::Color32::from_rgb(96, 165, 250);
                 
                 style.spacing.button_padding = egui::vec2(10.0, 5.0);
-                style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+                style.spacing.item_spacing = egui::vec2(10.0, 8.0);
             });
             runtime_log("=== miaocr 启动 ===");
 
