@@ -1,4 +1,4 @@
-﻿use anyhow::Result;
+use anyhow::Result;
 use eframe::egui;
 use screenshots::Screen;
 use std::sync::{Arc, Mutex};
@@ -1480,6 +1480,9 @@ impl eframe::App for FloatApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // 1. 截图隐藏逻辑的状态机处理
         if self.select_step == 1 {
+            // 先隐藏窗口的边框和标题栏，并移至屏幕外，使其被排除在截图之外。
+            // 这里不能使用 Visible(false)，因为隐藏窗口后 Windows 不再调用 egui update()，会导致状态机卡死。
+            ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(-10000.0, -10000.0)));
             self.select_step = 2;
             self.frame_delay = 5;
@@ -1491,6 +1494,12 @@ impl eframe::App for FloatApp {
                 // 截图鼠标所在的屏幕
                 if let Some(screens) = Screen::all().ok() {
                     let (mx, my) = get_cursor_pos().unwrap_or((0, 0));
+                    runtime_log(&format!("[SELECT] cursor pos: ({}, {})", mx, my));
+                    for (idx, scr) in screens.iter().enumerate() {
+                        let info = scr.display_info;
+                        runtime_log(&format!("[SELECT] screen {}: id={}, x={}, y={}, w={}, h={}, scale={}",
+                            idx, info.id, info.x, info.y, info.width, info.height, info.scale_factor));
+                    }
                     let active = screens
                         .iter()
                         .find(|s| {
@@ -1501,6 +1510,7 @@ impl eframe::App for FloatApp {
                                 && my < info.y + info.height as i32
                         })
                         .unwrap_or(&screens[0]);
+                    runtime_log(&format!("[SELECT] selected active screen: id={}", active.display_info.id));
 
                     if let Ok(image) = active.capture() {
                         self.screenshot_raw = image.as_raw().to_vec();
@@ -1523,7 +1533,7 @@ impl eframe::App for FloatApp {
             if let Some(info) = &self.active_screen_info {
                 #[cfg(target_os = "windows")]
                 let (logical_width, logical_height, logical_x, logical_y) = {
-                    let scale = info.scale_factor;
+                    let scale = ctx.pixels_per_point(); // 使用当前窗口的缩放比例进行精准坐标转换，防止跨屏 DPI 差异导致坐标偏移
                     (
                         info.width as f32 / scale,
                         info.height as f32 / scale,
@@ -1539,15 +1549,31 @@ impl eframe::App for FloatApp {
                     info.y as f32,
                 );
 
-                // 调整当前窗口位置和尺寸以匹配激活屏幕全屏
+                runtime_log(&format!("[SELECT] Moving window to logical pos: ({}, {}), logical size: ({}, {})",
+                    logical_x, logical_y, logical_width, logical_height));
+
+                // 移除窗口标题栏和边框，使其以完全无边框的覆盖层形式显示在目标屏幕上
+                ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(logical_x, logical_y)));
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(logical_width, logical_height)));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
 
                 self.mode = AppMode::Selecting;
                 self.drag_start = None;
                 self.drag_end = None;
                 self.screenshot_texture = None;
+            } else {
+                // 如果截图失败，恢复原来的窗口大小、位置和标题栏
+                let size = if self.expanded {
+                    self.expanded_size
+                } else {
+                    egui::vec2(200.0, 42.0)
+                };
+                ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(self.float_pos));
+                self.mode = AppMode::Float;
             }
             self.select_step = 0;
         }
@@ -1675,12 +1701,13 @@ impl eframe::App for FloatApp {
                                 }
                             }
                         }
-                        // 还原到悬浮窗尺寸
+                        // 还原到悬浮窗尺寸并恢复窗口边框
                         let size = if self.expanded {
                             self.expanded_size
                         } else {
                             egui::vec2(200.0, 42.0)
                         };
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
                         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
                         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(self.float_pos));
                         self.mode = AppMode::Float;
@@ -1692,6 +1719,7 @@ impl eframe::App for FloatApp {
                         } else {
                             egui::vec2(200.0, 42.0)
                         };
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
                         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
                         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(self.float_pos));
                         self.mode = AppMode::Float;
