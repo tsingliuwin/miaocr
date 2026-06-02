@@ -143,45 +143,83 @@ fn ocr_tesseract(bgra: &[u8], width: u32, height: u32) -> Result<String> {
     }
 }
 
+thread_local! {
+    static PADDLE_OCR_ENGINE: std::cell::RefCell<Option<pure_onnx_ocr::OcrEngine>> = std::cell::RefCell::new(None);
+}
+
 fn ocr_paddle(bgra: &[u8], width: u32, height: u32) -> Result<String> {
-    let temp_path = save_temp_png(bgra, width, height)?;
-    let output = std::process::Command::new("paddleocr")
-        .arg("--image_dir")
-        .arg(temp_path.to_str().unwrap())
-        .output();
+    let mut err_opt = None;
+    
+    let res = PADDLE_OCR_ENGINE.with(|cell| {
+        let mut lock = cell.borrow_mut();
+        if lock.is_none() {
+            let models_dir = app_dir().join("models");
+            let det_path = models_dir.join("det.onnx");
+            let rec_path = models_dir.join("rec.onnx");
+            let dict_path = models_dir.join("ppocr_keys_v1.txt");
 
-    let _ = std::fs::remove_file(temp_path);
+            if !det_path.exists() || !rec_path.exists() || !dict_path.exists() {
+                err_opt = Some(anyhow::anyhow!("本地 ONNX 模型文件缺失，请在界面中点击「安装」进行下载。"));
+                return None;
+            }
 
-    match output {
-        Ok(out) => {
-            if out.status.success() {
-                let text = String::from_utf8_lossy(&out.stdout).to_string();
+            match pure_onnx_ocr::OcrEngineBuilder::new()
+                .det_model_path(det_path)
+                .rec_model_path(rec_path)
+                .dictionary_path(dict_path)
+                .build()
+            {
+                Ok(ocr) => {
+                    *lock = Some(ocr);
+                }
+                Err(e) => {
+                    err_opt = Some(anyhow::anyhow!("初始化 PaddleOCR ONNX 引擎失败: {:?}", e));
+                    return None;
+                }
+            }
+        }
+        
+        let engine = lock.as_mut().unwrap();
+
+        let rgba_bytes: Vec<u8> = bgra.chunks_exact(4)
+            .flat_map(|p| [p[2], p[1], p[0], p[3]])
+            .collect();
+
+        let img_buffer = match image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(
+            width,
+            height,
+            rgba_bytes,
+        ) {
+            Some(buf) => buf,
+            None => {
+                err_opt = Some(anyhow::anyhow!("无法从内存字节重构图像缓冲区"));
+                return None;
+            }
+        };
+
+        let dynamic_img = image::DynamicImage::ImageRgba8(img_buffer);
+        
+        match engine.run_from_image(&dynamic_img) {
+            Ok(results) => {
                 let mut lines = Vec::new();
-                for line in text.lines() {
-                    if let Some(start_idx) = line.find("('") {
-                        if let Some(end_idx) = line[start_idx + 2..].find("',") {
-                            let actual_text = &line[start_idx + 2..start_idx + 2 + end_idx];
-                            lines.push(actual_text.to_string());
-                        }
+                for res in results {
+                    if !res.text.trim().is_empty() {
+                        lines.push(res.text);
                     }
                 }
-                if lines.is_empty() {
-                    Ok(text)
-                } else {
-                    Ok(lines.join("\n"))
-                }
-            } else {
-                let err = String::from_utf8_lossy(&out.stderr).to_string();
-                Err(anyhow::anyhow!("PaddleOCR 运行出错: {}", err))
+                Some(lines.join("\n"))
+            }
+            Err(e) => {
+                err_opt = Some(anyhow::anyhow!("PaddleOCR 本地推理出错: {:?}", e));
+                None
             }
         }
-        Err(e) => {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                Err(anyhow::anyhow!("未在系统 PATH 中找到 paddleocr.exe\n请先通过 pip install paddleocr 安装，并确保在环境变量中。"))
-            } else {
-                Err(anyhow::anyhow!("调用 PaddleOCR 失败: {}", e))
-            }
-        }
+    });
+
+    if let Some(err) = err_opt {
+        Err(err)
+    } else {
+        Ok(res.unwrap_or_default())
     }
 }
 
@@ -269,15 +307,108 @@ fn ensure_chi_sim() {
     }
 }
 
-/// 检测 paddleocr CLI 是否可用
+/// 检测本地 PaddleOCR ONNX 相关的模型文件是否存在
 fn detect_paddle() -> bool {
-    std::process::Command::new("paddleocr")
-        .arg("--help")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    let models_dir = app_dir().join("models");
+    let det_path = models_dir.join("det.onnx");
+    let rec_path = models_dir.join("rec.onnx");
+    let dict_path = models_dir.join("ppocr_keys_v1.txt");
+
+    det_path.exists() && rec_path.exists() && dict_path.exists()
+}
+
+/// 后台异步下载安装 PaddleOCR ONNX 引擎模型文件
+fn start_paddle_install(state: Arc<Mutex<InstallState>>, ctx: egui::Context) {
+    runtime_log("[INSTALL] PaddleOCR ONNX 下载开始");
+    std::thread::spawn(move || {
+        let set = |s: InstallState| {
+            *state.lock().unwrap() = s;
+            ctx.request_repaint();
+        };
+
+        let models_dir = app_dir().join("models");
+        let _ = std::fs::create_dir_all(&models_dir);
+
+        let det_path = models_dir.join("det.onnx");
+        let rec_path = models_dir.join("rec.onnx");
+        let dict_path = models_dir.join("ppocr_keys_v1.txt");
+
+        let det_url = "https://modelscope.cn/api/v1/models/RapidAI/RapidOCR/repo?FilePath=onnx/PP-OCRv4/det/ch_PP-OCRv4_det_mobile.onnx";
+        let rec_url = "https://modelscope.cn/api/v1/models/RapidAI/RapidOCR/repo?FilePath=onnx/PP-OCRv4/rec/ch_PP-OCRv4_rec_mobile.onnx";
+        let dict_url = "https://gitee.com/paddlepaddle/PaddleOCR/raw/release/2.7/ppocr/utils/ppocr_keys_v1.txt";
+
+        // 1. 下载文字检测模型 det.onnx
+        if !det_path.exists() {
+            set(InstallState::Installing("正在下载检测模型 det.onnx (约 4.5 MB)...".into()));
+            let status = std::process::Command::new("curl")
+                .args(["-L", "--connect-timeout", "15", "--retry", "3", "-o", det_path.to_str().unwrap(), det_url])
+                .status();
+            match status {
+                Ok(s) if s.success() => {}
+                Ok(s) => {
+                    let err = format!("下载检测模型失败 (exit {})。请检查代理或手动下载放入 ~/.miaocr/models/ 目录，地址: {}", s, det_url);
+                    runtime_log(&err);
+                    set(InstallState::Failed(err));
+                    return;
+                }
+                Err(e) => {
+                    let err = format!("启动 curl 下载检测模型失败: {}。请手动下载放入 ~/.miaocr/models/ 目录，地址: {}", e, det_url);
+                    runtime_log(&err);
+                    set(InstallState::Failed(err));
+                    return;
+                }
+            }
+        }
+
+        // 2. 下载文字识别模型 rec.onnx
+        if !rec_path.exists() {
+            set(InstallState::Installing("正在下载识别模型 rec.onnx (约 10 MB)...".into()));
+            let status = std::process::Command::new("curl")
+                .args(["-L", "--connect-timeout", "15", "--retry", "3", "-o", rec_path.to_str().unwrap(), rec_url])
+                .status();
+            match status {
+                Ok(s) if s.success() => {}
+                Ok(s) => {
+                    let err = format!("下载识别模型失败 (exit {})。请检查代理或手动下载放入 ~/.miaocr/models/ 目录，地址: {}", s, rec_url);
+                    runtime_log(&err);
+                    set(InstallState::Failed(err));
+                    return;
+                }
+                Err(e) => {
+                    let err = format!("启动 curl 下载识别模型失败: {}。请手动下载放入 ~/.miaocr/models/ 目录，地址: {}", e, rec_url);
+                    runtime_log(&err);
+                    set(InstallState::Failed(err));
+                    return;
+                }
+            }
+        }
+
+        // 3. 下载中文字典文件 ppocr_keys_v1.txt
+        if !dict_path.exists() {
+            set(InstallState::Installing("正在下载中文字典 ppocr_keys_v1.txt...".into()));
+            let status = std::process::Command::new("curl")
+                .args(["-L", "--connect-timeout", "15", "--retry", "3", "-o", dict_path.to_str().unwrap(), dict_url])
+                .status();
+            match status {
+                Ok(s) if s.success() => {}
+                Ok(s) => {
+                    let err = format!("下载字典文件失败 (exit {})。请检查代理或手动下载放入 ~/.miaocr/models/ 目录，地址: {}", s, dict_url);
+                    runtime_log(&err);
+                    set(InstallState::Failed(err));
+                    return;
+                }
+                Err(e) => {
+                    let err = format!("启动 curl 下载字典文件失败: {}。请手动下载放入 ~/.miaocr/models/ 目录，地址: {}", e, dict_url);
+                    runtime_log(&err);
+                    set(InstallState::Failed(err));
+                    return;
+                }
+            }
+        }
+
+        runtime_log("[INSTALL] PaddleOCR ONNX 下载完成");
+        set(InstallState::Available);
+    });
 }
 
 
@@ -1159,18 +1290,18 @@ impl eframe::App for FloatApp {
                                         }
                                         InstallState::NotInstalled => {
                                             ui.label(egui::RichText::new("✗").size(11.0).color(egui::Color32::RED));
-                                            // 仅 Tesseract 提供一键安装
-                                            if current_backend == BackendType::Tesseract {
-                                                if ui.small_button("安装").clicked() {
+                                            if ui.small_button("安装").clicked() {
+                                                if current_backend == BackendType::Tesseract {
                                                     start_tesseract_install(
                                                         self.tess_state.clone(),
                                                         ui.ctx().clone(),
                                                     );
+                                                } else if current_backend == BackendType::PaddleOcr {
+                                                    start_paddle_install(
+                                                        self.paddle_state.clone(),
+                                                        ui.ctx().clone(),
+                                                    );
                                                 }
-                                            } else {
-                                                // PaddleOCR ONNX 版本即将支持
-                                                ui.label(egui::RichText::new("未安装").size(10.0).color(egui::Color32::GRAY))
-                                                    .on_hover_text("PaddleOCR ONNX 版本即将支持，敬请期待");
                                             }
                                         }
                                         InstallState::Installing(msg) => {
@@ -1191,13 +1322,18 @@ impl eframe::App for FloatApp {
                                                     .size(10.0)
                                                     .color(egui::Color32::RED),
                                             ).on_hover_text(err.as_str());
-                                            if current_backend == BackendType::Tesseract
-                                                && ui.small_button("重试").clicked()
-                                            {
-                                                start_tesseract_install(
-                                                    self.tess_state.clone(),
-                                                    ui.ctx().clone(),
-                                                );
+                                            if ui.small_button("重试").clicked() {
+                                                if current_backend == BackendType::Tesseract {
+                                                    start_tesseract_install(
+                                                        self.tess_state.clone(),
+                                                        ui.ctx().clone(),
+                                                    );
+                                                } else if current_backend == BackendType::PaddleOcr {
+                                                    start_paddle_install(
+                                                        self.paddle_state.clone(),
+                                                        ui.ctx().clone(),
+                                                    );
+                                                }
                                             }
                                         }
                                     }
