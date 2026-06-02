@@ -1979,62 +1979,7 @@ impl eframe::App for FloatApp {
                 .frame(card_frame)
                 .show(ctx, |ui| {
                     ui.vertical(|ui| {
-                        // ── 顶部操作栏 ──
-                        ui.horizontal(|ui| {
-                            // 选区按钮 (虚线选框图标)
-                            let sel_btn = ui.button("⛶ 选区");
-                            if sel_btn.clicked() {
-                                if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
-                                    if rect.min.x > -9000.0 && rect.min.y > -9000.0 {
-                                        self.float_pos = rect.min;
-                                    }
-                                }
-                                *self.ocr_region.lock().unwrap() = None;
-                                *self.paused.lock().unwrap() = true;
-                                self.select_step = 1;
-                            }
-                            sel_btn.on_hover_text("选择屏幕区域开始持续 OCR 识别");
-
-                            // 继续/暂停按钮
-                            let has_region = self.ocr_region.lock().unwrap().is_some();
-                            if has_region {
-                                let is_paused = *self.paused.lock().unwrap();
-                                let play_pause_btn = if is_paused { "▶ 继续" } else { "▶I 暂停" };
-                                let btn_res = ui.button(play_pause_btn);
-                                if btn_res.clicked() {
-                                    let mut p = self.paused.lock().unwrap();
-                                    *p = !*p;
-                                }
-                                btn_res.on_hover_text(if is_paused { "继续识别" } else { "暂停识别" });
-                            }
-
-                            // 耗时与间隔时钟显示 (右对齐)
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let ms = *self.elapsed.lock().unwrap();
-                                let interval = *self.interval.lock().unwrap();
-                                if ms > 0 {
-                                    ui.label(
-                                        egui::RichText::new(format!("🕒 {}ms / {}ms", ms, interval))
-                                            .color(egui::Color32::from_rgb(156, 163, 175))
-                                            .size(11.0),
-                                    );
-                                }
-                            });
-                        });
-
-                        ui.add_space(6.0);
-                        // 极细的半透明白色分割线
-                        let stroke_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 15);
-                        let cursor_y = ui.cursor().min.y;
-                        let width = ui.available_width();
-                        ui.painter().hline(
-                            ui.cursor().min.x..=(ui.cursor().min.x + width),
-                            cursor_y,
-                            egui::Stroke::new(1.0, stroke_color),
-                        );
-                        ui.add_space(8.0);
-
-                        // ── 引擎选择及状态行 ──
+                        // ── 引擎选择及状态行 (移至顶部) ──
                         ui.horizontal(|ui| {
                             ui.set_min_height(ui.spacing().interact_size.y);
                             ui.horizontal_centered(|ui| {
@@ -2217,16 +2162,6 @@ impl eframe::App for FloatApp {
                                     }
                                 }
                             }
-
-                            // 复制按钮
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let text = self.text.lock().unwrap().clone();
-                                let copy_btn = ui.button("📋 复制");
-                                if copy_btn.clicked() {
-                                    ui.output_mut(|o| o.copied_text = text);
-                                }
-                                copy_btn.on_hover_text("复制识别结果到剪贴板");
-                            });
                         });
 
                         // ── 百度 AI Studio 配置行 ──
@@ -2288,7 +2223,78 @@ impl eframe::App for FloatApp {
                             }
                         }
 
-                        ui.add_space(4.0);
+                        ui.add_space(6.0);
+                        // 极细的半透明白色分割线
+                        let stroke_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 15);
+                        let cursor_y = ui.cursor().min.y;
+                        let width = ui.available_width();
+                        ui.painter().hline(
+                            ui.cursor().min.x..=(ui.cursor().min.x + width),
+                            cursor_y,
+                            egui::Stroke::new(1.0, stroke_color),
+                        );
+                        ui.add_space(8.0);
+
+                        // ── 操作栏 (选区、暂停、复制、耗时，在下面) ──
+                        ui.horizontal(|ui| {
+                            // 选区按钮 (虚线选框图标)
+                            let sel_btn = ui.button("⛶ 选区");
+                            if sel_btn.clicked() {
+                                if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
+                                    if rect.min.x > -9000.0 && rect.min.y > -9000.0 {
+                                        self.float_pos = rect.min;
+                                    }
+                                }
+                                *self.ocr_region.lock().unwrap() = None;
+                                *self.paused.lock().unwrap() = true;
+                                self.select_step = 1;
+                            }
+                            sel_btn.on_hover_text("选择屏幕区域开始持续 OCR 识别");
+
+                            // 继续/暂停按钮
+                            let has_region = self.ocr_region.lock().unwrap().is_some();
+                            if has_region {
+                                let is_paused = *self.paused.lock().unwrap();
+                                let play_pause_btn = if is_paused { "▶ 继续" } else { "▶I 暂停" };
+                                let btn_res = ui.button(play_pause_btn);
+                                if btn_res.clicked() {
+                                    let mut p = self.paused.lock().unwrap();
+                                    *p = !*p;
+                                }
+                                btn_res.on_hover_text(if is_paused { "继续识别" } else { "暂停识别" });
+                            }
+
+                            // 复制按钮
+                            let text = self.text.lock().unwrap().clone();
+                            let copy_btn = ui.button("📋 复制");
+                            if copy_btn.clicked() {
+                                ui.output_mut(|o| o.copied_text = text);
+                            }
+                            copy_btn.on_hover_text("复制识别结果到剪贴板");
+
+                            // 耗时与间隔时钟显示 (右对齐)
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let ms = *self.elapsed.lock().unwrap();
+                                let interval = *self.interval.lock().unwrap();
+                                if ms > 0 {
+                                    ui.label(
+                                        egui::RichText::new(format!("🕒 {}ms / {}ms", ms, interval))
+                                            .color(egui::Color32::from_rgb(156, 163, 175))
+                                            .size(11.0),
+                                    );
+                                }
+                            });
+                        });
+
+                        ui.add_space(6.0);
+                        // 第二个分割线，隔开操作栏与文本内容
+                        let cursor_y = ui.cursor().min.y;
+                        ui.painter().hline(
+                            ui.cursor().min.x..=(ui.cursor().min.x + width),
+                            cursor_y,
+                            egui::Stroke::new(1.0, stroke_color),
+                        );
+                        ui.add_space(8.0);
 
                         // ── 内容展示区 ──
                         let mut text_lock = self.text.lock().unwrap();
