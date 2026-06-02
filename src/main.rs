@@ -310,9 +310,20 @@ fn clear_rapid_engine() {
     });
 }
 
+fn clear_ocr_rs_engine() {
+    OCR_RS_ENGINE.with(|cell| {
+        let mut lock = cell.borrow_mut();
+        if lock.is_some() {
+            runtime_log("[ENGINE] 切换后端，释放 PP-OCRv5 (ocr-rs) 引擎");
+            *lock = None;
+        }
+    });
+}
+
 thread_local! {
     static PADDLE_OCR_ENGINE: std::cell::RefCell<Option<JsonOcrEngine>> = std::cell::RefCell::new(None);
     static RAPID_OCR_ENGINE: std::cell::RefCell<Option<JsonOcrEngine>> = std::cell::RefCell::new(None);
+    static OCR_RS_ENGINE: std::cell::RefCell<Option<ocr_rs::OcrEngine>> = std::cell::RefCell::new(None);
 }
 
 fn ocr_paddle(bgra: &[u8], width: u32, height: u32) -> Result<String> {
@@ -438,6 +449,75 @@ fn ocr_rapid(bgra: &[u8], width: u32, height: u32) -> Result<String> {
         } else {
             Ok(res.unwrap_or_default())
         }
+    }
+}
+
+fn ocr_ocr_rs(bgra: &[u8], width: u32, height: u32) -> Result<String> {
+    let mut err_opt = None;
+    
+    let res = OCR_RS_ENGINE.with(|cell| {
+        let mut lock = cell.borrow_mut();
+        if lock.is_none() {
+            if !detect_ocr_rs() {
+                err_opt = Some(anyhow::anyhow!("本地 PP-OCRv5 引擎模型未安装。请在界面中点击「安装」。"));
+                return None;
+            }
+            let models_dir = app_dir().join("models");
+            let det_path = models_dir.join("PP-OCRv5_mobile_det.mnn");
+            let rec_path = models_dir.join("PP-OCRv5_mobile_rec.mnn");
+            let keys_path = models_dir.join("ppocr_keys_v5.txt");
+            
+            match ocr_rs::OcrEngine::new(&det_path, &rec_path, &keys_path, None) {
+                Ok(engine) => {
+                    *lock = Some(engine);
+                }
+                Err(e) => {
+                    err_opt = Some(anyhow::anyhow!("初始化 PP-OCRv5 引擎失败: {:?}", e));
+                    return None;
+                }
+            }
+        }
+        
+        let engine = lock.as_mut().unwrap();
+        
+        let rgba_bytes: Vec<u8> = bgra.chunks_exact(4)
+            .flat_map(|p| [p[2], p[1], p[0], p[3]])
+            .collect();
+            
+        let img_buffer = match image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(
+            width,
+            height,
+            rgba_bytes,
+        ) {
+            Some(buf) => buf,
+            None => {
+                err_opt = Some(anyhow::anyhow!("Failed to convert image buffer for OCR"));
+                return None;
+            }
+        };
+        let img = image::DynamicImage::ImageRgba8(img_buffer);
+        
+        let ocr_res = engine.recognize(&img);
+        
+        match ocr_res {
+            Ok(results) => {
+                let mut lines = Vec::new();
+                for item in results {
+                    lines.push(item.text);
+                }
+                Some(lines.join("\n"))
+            }
+            Err(e) => {
+                err_opt = Some(anyhow::anyhow!("PP-OCRv5 识别失败: {:?}", e));
+                None
+            }
+        }
+    });
+    
+    if let Some(err) = err_opt {
+        Err(err)
+    } else {
+        Ok(res.unwrap_or_default())
     }
 }
 
@@ -649,6 +729,129 @@ fn detect_rapid() -> bool {
     {
         find_rapid_exe().is_some()
     }
+}
+
+/// 检测本地 PP-OCRv5 (ocr-rs) 模型文件是否齐全且大小正确
+fn detect_ocr_rs() -> bool {
+    let models_dir = app_dir().join("models");
+    let det = models_dir.join("PP-OCRv5_mobile_det.mnn");
+    let rec = models_dir.join("PP-OCRv5_mobile_rec.mnn");
+    let keys = models_dir.join("ppocr_keys_v5.txt");
+    
+    let is_valid = |path: &std::path::Path, min_size: u64| {
+        path.metadata().map(|m| m.len() >= min_size).unwrap_or(false)
+    };
+    
+    is_valid(&det, 1024 * 1024) && is_valid(&rec, 5 * 1024 * 1024) && is_valid(&keys, 10 * 1024)
+}
+
+fn download_file_with_mirrors(
+    dest_path: &Path,
+    github_raw_path: &str,
+    label: &str,
+    set_state: &dyn Fn(String),
+) -> Result<()> {
+    let urls = [
+        format!("https://mirror.ghproxy.com/https://github.com/{}", github_raw_path),
+        format!("https://ghproxy.net/https://github.com/{}", github_raw_path),
+        format!("https://github.com/{}", github_raw_path),
+    ];
+    let mut last_error_msg = String::new();
+    for (idx, url) in urls.iter().enumerate() {
+        set_state(format!("正在下载 {} (源 {}/{})...", label, idx + 1, urls.len()));
+        runtime_log(&format!("[INSTALL] 尝试下载 {}: {}", label, url));
+        let status = std::process::Command::new("curl")
+            .args(["-f", "-k", "-L", "--connect-timeout", "30", "--retry", "2", "-o", dest_path.to_str().unwrap(), url])
+            .status();
+        match status {
+            Ok(s) if s.success() => {
+                runtime_log(&format!("[INSTALL] {} 下载成功", label));
+                return Ok(());
+            }
+            Ok(s) => {
+                last_error_msg = format!("退出码 {}", s);
+                runtime_log(&format!("[INSTALL] 源 {} 下载失败: {}", idx + 1, last_error_msg));
+            }
+            Err(e) => {
+                last_error_msg = format!("启动失败: {}", e);
+                runtime_log(&format!("[INSTALL] 无法启动 curl (源 {}): {}", idx + 1, last_error_msg));
+            }
+        }
+    }
+    Err(anyhow::anyhow!("下载 {} 失败: {}", label, last_error_msg))
+}
+
+/// 后台异步下载安装 PP-OCRv5 模型
+fn start_ocr_rs_install(state: Arc<Mutex<InstallState>>, ctx: egui::Context) {
+    runtime_log("[INSTALL] PP-OCRv5 (ocr-rs) 模型下载开始");
+    std::thread::spawn(move || {
+        let set = |s: InstallState| {
+            *state.lock().unwrap() = s;
+            ctx.request_repaint();
+        };
+        
+        let models_dir = app_dir().join("models");
+        let det_path = models_dir.join("PP-OCRv5_mobile_det.mnn");
+        let rec_path = models_dir.join("PP-OCRv5_mobile_rec.mnn");
+        let keys_path = models_dir.join("ppocr_keys_v5.txt");
+        
+        let set_msg = |msg: String| {
+            set(InstallState::Installing(msg));
+        };
+        
+        let is_valid = |path: &std::path::Path, min_size: u64| {
+            path.metadata().map(|m| m.len() >= min_size).unwrap_or(false)
+        };
+        
+        if !is_valid(&det_path, 1024 * 1024) {
+            let _ = std::fs::remove_file(&det_path);
+            if let Err(e) = download_file_with_mirrors(
+                &det_path,
+                "zibo-chen/rust-paddle-ocr/raw/main/models/PP-OCRv5_mobile_det.mnn",
+                "检测模型 (约 4.5 MB)",
+                &set_msg,
+            ) {
+                let _ = std::fs::remove_file(&det_path);
+                set(InstallState::Failed(e.to_string()));
+                return;
+            }
+        }
+        
+        if !is_valid(&rec_path, 5 * 1024 * 1024) {
+            let _ = std::fs::remove_file(&rec_path);
+            if let Err(e) = download_file_with_mirrors(
+                &rec_path,
+                "zibo-chen/rust-paddle-ocr/raw/main/models/PP-OCRv5_mobile_rec.mnn",
+                "识别模型 (约 15.7 MB)",
+                &set_msg,
+            ) {
+                let _ = std::fs::remove_file(&rec_path);
+                set(InstallState::Failed(e.to_string()));
+                return;
+            }
+        }
+        
+        if !is_valid(&keys_path, 10 * 1024) {
+            let _ = std::fs::remove_file(&keys_path);
+            if let Err(e) = download_file_with_mirrors(
+                &keys_path,
+                "zibo-chen/rust-paddle-ocr/raw/main/models/ppocr_keys_v5.txt",
+                "字符集 (约 74 KB)",
+                &set_msg,
+            ) {
+                let _ = std::fs::remove_file(&keys_path);
+                set(InstallState::Failed(e.to_string()));
+                return;
+            }
+        }
+        
+        if detect_ocr_rs() {
+            runtime_log("[INSTALL] PP-OCRv5 模型下载及安装完成");
+            set(InstallState::Available);
+        } else {
+            set(InstallState::Failed("模型下载已完成，但检测失败，请重试".to_string()));
+        }
+    });
 }
 
 /// 后台异步下载安装 RapidOCR-json 引擎
@@ -1201,6 +1404,9 @@ fn ocr_region(
     if backend != BackendType::RapidOcr {
         clear_rapid_engine();
     }
+    if backend != BackendType::OcrRs {
+        clear_ocr_rs_engine();
+    }
 
     match backend {
         BackendType::WindowsNative => {
@@ -1315,6 +1521,16 @@ fn ocr_region(
             )?;
             Ok(text)
         }
+        BackendType::OcrRs => {
+            let text = ocr_ocr_rs(&bgra, final_width, final_height)?;
+            let clean: String = text
+                .lines()
+                .map(|l: &str| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(clean)
+        }
     }
 }
 
@@ -1357,6 +1573,7 @@ enum BackendType {
     PaddleOcr,
     RapidOcr,
     BaiduAiStudio,
+    OcrRs,
 }
 
 impl BackendType {
@@ -1368,6 +1585,7 @@ impl BackendType {
             BackendType::PaddleOcr   => "PaddleOCR (本地)",
             BackendType::RapidOcr    => "RapidOCR (本地)",
             BackendType::BaiduAiStudio => "百度 AI Studio (云端)",
+            BackendType::OcrRs        => "PP-OCRv5 (本地)",
         }
     }
 
@@ -1379,6 +1597,7 @@ impl BackendType {
             BackendType::PaddleOcr     => "PaddleOCR",
             BackendType::RapidOcr      => "RapidOCR",
             BackendType::BaiduAiStudio => "BaiduAiStudio",
+            BackendType::OcrRs         => "OcrRs",
         }
     }
 }
@@ -1486,6 +1705,7 @@ struct FloatApp {
     tess_state:   Arc<Mutex<InstallState>>,
     paddle_state: Arc<Mutex<InstallState>>,
     rapid_state:  Arc<Mutex<InstallState>>,
+    ocr_rs_state: Arc<Mutex<InstallState>>,
 
     // 记忆悬浮窗的窗口大小（用户可以拖动调整）
     float_size: egui::Vec2,
@@ -1833,6 +2053,7 @@ impl eframe::App for FloatApp {
                                     #[cfg(target_os = "macos")]
                                     ui.selectable_value(&mut current_backend, BackendType::MacNative, "macOS 原生");
                                     ui.selectable_value(&mut current_backend, BackendType::Tesseract,    "Tesseract");
+                                    ui.selectable_value(&mut current_backend, BackendType::OcrRs,        "PP-OCRv5 (本地)");
                                     #[cfg(target_os = "windows")]
                                     ui.selectable_value(&mut current_backend, BackendType::PaddleOcr,    "PaddleOCR");
                                     #[cfg(target_os = "windows")]
@@ -1856,13 +2077,17 @@ impl eframe::App for FloatApp {
                                     BackendType::RapidOcr => {
                                         *self.rapid_state.lock().unwrap() == InstallState::Unchecked
                                     }
+                                    BackendType::OcrRs => {
+                                        *self.ocr_rs_state.lock().unwrap() == InstallState::Unchecked
+                                    }
                                     _ => false,
                                 };
                                 if need_check {
                                     let (state_arc, ctx_clone) = match current_backend {
                                         BackendType::Tesseract => (self.tess_state.clone(), ui.ctx().clone()),
                                         BackendType::PaddleOcr => (self.paddle_state.clone(), ui.ctx().clone()),
-                                        _ => (self.rapid_state.clone(), ui.ctx().clone()),
+                                        BackendType::RapidOcr => (self.rapid_state.clone(), ui.ctx().clone()),
+                                        _ => (self.ocr_rs_state.clone(), ui.ctx().clone()),
                                     };
                                     *state_arc.lock().unwrap() = InstallState::Checking;
                                     let b_type = current_backend;
@@ -1870,7 +2095,8 @@ impl eframe::App for FloatApp {
                                         let available = match b_type {
                                             BackendType::Tesseract => detect_tesseract(),
                                             BackendType::PaddleOcr => detect_paddle(),
-                                            _ => detect_rapid(),
+                                            BackendType::RapidOcr => detect_rapid(),
+                                            _ => detect_ocr_rs(),
                                         };
                                         *state_arc.lock().unwrap() = if available {
                                             InstallState::Available
@@ -1887,6 +2113,7 @@ impl eframe::App for FloatApp {
                                 BackendType::Tesseract => Some(self.tess_state.lock().unwrap().clone()),
                                 BackendType::PaddleOcr => Some(self.paddle_state.lock().unwrap().clone()),
                                 BackendType::RapidOcr  => Some(self.rapid_state.lock().unwrap().clone()),
+                                BackendType::OcrRs     => Some(self.ocr_rs_state.lock().unwrap().clone()),
                                 _ => None,
                             };
                             
@@ -1923,6 +2150,7 @@ impl eframe::App for FloatApp {
                                                     BackendType::Tesseract => start_tesseract_install(self.tess_state.clone(), ui.ctx().clone()),
                                                     BackendType::PaddleOcr => start_paddle_install(self.paddle_state.clone(), ui.ctx().clone()),
                                                     BackendType::RapidOcr => start_rapid_install(self.rapid_state.clone(), ui.ctx().clone()),
+                                                    BackendType::OcrRs => start_ocr_rs_install(self.ocr_rs_state.clone(), ui.ctx().clone()),
                                                     _ => {}
                                                 }
                                             }
@@ -1943,6 +2171,12 @@ impl eframe::App for FloatApp {
                                                     "下载中 (PaddleOCR)...".to_string()
                                                 } else if msg.contains("RapidOCR") {
                                                     "下载中 (RapidOCR)...".to_string()
+                                                } else if msg.contains("检测模型") {
+                                                    "下载中 (检测模型)...".to_string()
+                                                } else if msg.contains("识别模型") {
+                                                    "下载中 (识别模型)...".to_string()
+                                                } else if msg.contains("字符集") {
+                                                    "下载中 (字符集)...".to_string()
                                                 } else {
                                                     "下载中...".to_string()
                                                 }
@@ -1975,6 +2209,7 @@ impl eframe::App for FloatApp {
                                                     BackendType::Tesseract => start_tesseract_install(self.tess_state.clone(), ui.ctx().clone()),
                                                     BackendType::PaddleOcr => start_paddle_install(self.paddle_state.clone(), ui.ctx().clone()),
                                                     BackendType::RapidOcr => start_rapid_install(self.rapid_state.clone(), ui.ctx().clone()),
+                                                    BackendType::OcrRs => start_ocr_rs_install(self.ocr_rs_state.clone(), ui.ctx().clone()),
                                                     _ => {}
                                                 }
                                             }
@@ -2251,6 +2486,7 @@ fn main() -> Result<()> {
     let shared_tess_state   = Arc::new(Mutex::new(InstallState::Unchecked));
     let shared_paddle_state = Arc::new(Mutex::new(InstallState::Unchecked));
     let shared_rapid_state  = Arc::new(Mutex::new(InstallState::Unchecked));
+    let shared_ocr_rs_state = Arc::new(Mutex::new(InstallState::Unchecked));
 
     // 2. 设定始终置顶的悬浮窗口参数（使用系统标题栏和边框）
     let options = eframe::NativeOptions {
@@ -2353,14 +2589,15 @@ fn main() -> Result<()> {
             });
             runtime_log("=== miaocr 启动 ===");
 
-            // 3. 启动引擎环境初始检测线程（启动时静默检测 Tesseract / PaddleOCR / RapidOCR）
+            // 3. 启动引擎环境初始检测线程（启动时静默检测 Tesseract / PaddleOCR / RapidOCR / PP-OCRv5）
             {
                 let tess_state   = shared_tess_state.clone();
                 let paddle_state = shared_paddle_state.clone();
                 let rapid_state  = shared_rapid_state.clone();
+                let ocr_rs_state = shared_ocr_rs_state.clone();
                 let ctx_detect = cc.egui_ctx.clone();
                 std::thread::spawn(move || {
-                    // 并发检测三个引擎
+                    // 并发检测四个引擎
                     let t1 = {
                         let ts = tess_state.clone();
                         let c  = ctx_detect.clone();
@@ -2400,9 +2637,23 @@ fn main() -> Result<()> {
                             c.request_repaint();
                         })
                     };
+                    let t4 = {
+                        let os = ocr_rs_state.clone();
+                        let c  = ctx_detect.clone();
+                        std::thread::spawn(move || {
+                            *os.lock().unwrap() = InstallState::Checking;
+                            c.request_repaint();
+                            let avail = detect_ocr_rs();
+                            runtime_log(&format!("[DETECT] PP-OCRv5 (ocr-rs): {}",
+                                if avail { "已安装" } else { "未安装" }));
+                            *os.lock().unwrap() = if avail { InstallState::Available } else { InstallState::NotInstalled };
+                            c.request_repaint();
+                        })
+                    };
                     let _ = t1.join();
                     let _ = t2.join();
                     let _ = t3.join();
+                    let _ = t4.join();
                 });
             }
 
@@ -2527,6 +2778,7 @@ fn main() -> Result<()> {
                 tess_state:   shared_tess_state,
                 paddle_state: shared_paddle_state,
                 rapid_state:  shared_rapid_state,
+                ocr_rs_state: shared_ocr_rs_state,
                 float_size: egui::vec2(350.0, 300.0),
                 screenshot_texture: None,
                 screenshot_raw: Vec::new(),
