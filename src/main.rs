@@ -862,34 +862,151 @@ fn start_tesseract_install(state: Arc<Mutex<InstallState>>, ctx: egui::Context) 
 }
 
 
-fn ocr_api(bgra: &[u8], width: u32, height: u32, url: &str) -> Result<String> {
+
+
+fn ocr_baidu_aistudio(
+    bgra: &[u8],
+    width: u32,
+    height: u32,
+    token: &str,
+    model: &str,
+    use_orientation: bool,
+    use_unwarping: bool,
+    use_chart: bool,
+) -> Result<String> {
     let temp_path = save_temp_png(bgra, width, height)?;
+    let temp_str = temp_path.to_str().unwrap();
+
+    let payload = serde_json::json!({
+        "useDocOrientationClassify": use_orientation,
+        "useDocUnwarping": use_unwarping,
+        "useChartRecognition": use_chart,
+    });
+    let payload_str = serde_json::to_string(&payload)?;
+
+    // 1. Submit Job
     let output = std::process::Command::new("curl")
         .arg("-s")
+        .arg("-k")
+        .arg("-H")
+        .arg(format!("Authorization: bearer {}", token))
         .arg("-F")
-        .arg(format!("image=@{}", temp_path.to_str().unwrap()))
-        .arg(url)
+        .arg(format!("model={}", model))
+        .arg("-F")
+        .arg(format!("optionalPayload={}", payload_str))
+        .arg("-F")
+        .arg(format!("file=@{}", temp_str))
+        .arg("https://paddleocr.aistudio-app.com/api/v2/ocr/jobs")
         .output();
 
-    let _ = std::fs::remove_file(temp_path);
+    let _ = std::fs::remove_file(&temp_path);
 
-    match output {
-        Ok(out) => {
-            if out.status.success() {
-                let text = String::from_utf8_lossy(&out.stdout).to_string();
-                Ok(text)
-            } else {
-                let err = String::from_utf8_lossy(&out.stderr).to_string();
-                Err(anyhow::anyhow!("API 服务器错误: {}", err))
-            }
-        }
+    let out = match output {
+        Ok(out) => out,
         Err(e) => {
             if e.kind() == std::io::ErrorKind::NotFound {
-                Err(anyhow::anyhow!("系统未找到 curl.exe，请确保您的 Windows 环境正常。"))
+                return Err(anyhow::anyhow!("系统未找到 curl.exe，请确保环境正常。"));
             } else {
-                Err(anyhow::anyhow!("发送 API 请求失败: {}", e))
+                return Err(anyhow::anyhow!("发送请求失败: {}", e));
             }
         }
+    };
+
+    if !out.status.success() {
+        let err_str = String::from_utf8_lossy(&out.stderr).to_string();
+        return Err(anyhow::anyhow!("提交任务请求失败 (curl 错误): {}", err_str));
+    }
+
+    let resp_str = String::from_utf8_lossy(&out.stdout);
+    let resp: serde_json::Value = serde_json::from_str(&resp_str)
+        .map_err(|e| anyhow::anyhow!("解析提交任务响应失败: {}, 响应为: {}", e, resp_str))?;
+
+    if resp["code"] != 0 {
+        return Err(anyhow::anyhow!("提交任务 API 错误: {}", resp["msg"].as_str().unwrap_or("未知错误")));
+    }
+
+    let job_id = resp["data"]["jobId"].as_str()
+        .ok_or_else(|| anyhow::anyhow!("未能在响应中找到 jobId: {}", resp_str))?;
+
+    // 2. Poll for results (Incremental Backoff Polling)
+    let json_url = {
+        let poll_start = std::time::Instant::now();
+        let mut sleep_ms = 200;
+        loop {
+            if poll_start.elapsed().as_secs() > 30 {
+                return Err(anyhow::anyhow!("轮询超时 (30秒)"));
+            }
+
+            let poll_out = std::process::Command::new("curl")
+                .arg("-s")
+                .arg("-k")
+                .arg("-H")
+                .arg(format!("Authorization: bearer {}", token))
+                .arg(format!("https://paddleocr.aistudio-app.com/api/v2/ocr/jobs/{}", job_id))
+                .output()?;
+
+            if poll_out.status.success() {
+                let poll_resp_str = String::from_utf8_lossy(&poll_out.stdout);
+                if let Ok(poll_resp) = serde_json::from_str::<serde_json::Value>(&poll_resp_str) {
+                    if poll_resp["code"] != 0 {
+                        return Err(anyhow::anyhow!("轮询 API 错误: {}", poll_resp["msg"].as_str().unwrap_or("未知错误")));
+                    }
+
+                    let state = poll_resp["data"]["state"].as_str().unwrap_or("");
+                    if state == "done" {
+                        if let Some(url) = poll_resp["data"]["resultUrl"]["jsonUrl"].as_str() {
+                            break url.to_string();
+                        } else {
+                            return Err(anyhow::anyhow!("任务已完成，但未找到 jsonUrl"));
+                        }
+                    } else if state == "failed" {
+                        let err_msg = poll_resp["data"]["errorMsg"].as_str().unwrap_or("未知错误原因");
+                        return Err(anyhow::anyhow!("任务识别失败: {}", err_msg));
+                    }
+                }
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+            if sleep_ms < 500 {
+                sleep_ms += 100;
+            }
+        }
+    };
+
+    // 3. Download and parse results
+    let result_out = std::process::Command::new("curl")
+        .arg("-s")
+        .arg("-k")
+        .arg(&json_url)
+        .output()?;
+
+    if !result_out.status.success() {
+        return Err(anyhow::anyhow!("下载识别结果失败"));
+    }
+
+    let result_str = String::from_utf8_lossy(&result_out.stdout);
+    let mut ocr_text = Vec::new();
+
+    for line in result_str.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(layouts) = val["result"]["layoutParsingResults"].as_array() {
+                for layout in layouts {
+                    if let Some(txt) = layout["markdown"]["text"].as_str() {
+                        ocr_text.push(txt.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if ocr_text.is_empty() {
+        Ok(String::from("未识别到文字"))
+    } else {
+        Ok(ocr_text.join("\n"))
     }
 }
 
@@ -961,7 +1078,11 @@ fn ocr_region(
     width: u32,
     height: u32,
     backend: BackendType,
-    api_url: &str,
+    baidu_token: &str,
+    baidu_model: &str,
+    baidu_use_orientation: bool,
+    baidu_use_unwarping: bool,
+    baidu_use_chart: bool,
 ) -> Result<String> {
     let screens = Screen::all()?;
     if screens.is_empty() {
@@ -1147,8 +1268,17 @@ fn ocr_region(
                 .join("\n");
             Ok(clean)
         }
-        BackendType::CloudApi => {
-            let text = ocr_api(&bgra, final_width, final_height, api_url)?;
+        BackendType::BaiduAiStudio => {
+            let text = ocr_baidu_aistudio(
+                &bgra,
+                final_width,
+                final_height,
+                baidu_token,
+                baidu_model,
+                baidu_use_orientation,
+                baidu_use_unwarping,
+                baidu_use_chart,
+            )?;
             Ok(text)
         }
     }
@@ -1185,14 +1315,14 @@ fn get_cursor_pos() -> Option<(i32, i32)> {
 // ─── 悬浮窗应用 ──────────────────────────────────────────
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum BackendType {
     WindowsNative,
     MacNative,
     Tesseract,
     PaddleOcr,
     RapidOcr,
-    CloudApi,
+    BaiduAiStudio,
 }
 
 impl BackendType {
@@ -1203,7 +1333,7 @@ impl BackendType {
             BackendType::Tesseract    => "Tesseract (本地)",
             BackendType::PaddleOcr   => "PaddleOCR (本地)",
             BackendType::RapidOcr    => "RapidOCR (本地)",
-            BackendType::CloudApi    => "自定义 API",
+            BackendType::BaiduAiStudio => "百度 AI Studio (云端)",
         }
     }
 
@@ -1214,8 +1344,72 @@ impl BackendType {
             BackendType::Tesseract     => "Tesseract",
             BackendType::PaddleOcr     => "PaddleOCR",
             BackendType::RapidOcr      => "RapidOCR",
-            BackendType::CloudApi      => "CloudAPI",
+            BackendType::BaiduAiStudio => "BaiduAiStudio",
         }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+struct AppSettings {
+    selected_backend: BackendType,
+    baidu_token: String,
+    baidu_model: String,
+    baidu_use_orientation: bool,
+    baidu_use_unwarping: bool,
+    baidu_use_chart: bool,
+}
+
+impl AppSettings {
+    fn load() -> Self {
+        let path = app_dir().join("settings.json");
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Ok(settings) = serde_json::from_str::<AppSettings>(&content) {
+                return settings;
+            }
+        }
+        // 默认配置
+        AppSettings {
+            selected_backend: {
+                #[cfg(target_os = "windows")]
+                {
+                    BackendType::WindowsNative
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    BackendType::MacNative
+                }
+                #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+                {
+                    BackendType::Tesseract
+                }
+            },
+            baidu_token: String::new(),
+            baidu_model: String::from("PaddleOCR-VL-1.6"),
+            baidu_use_orientation: false,
+            baidu_use_unwarping: false,
+            baidu_use_chart: false,
+        }
+    }
+
+    fn save(&self) {
+        let path = app_dir().join("settings.json");
+        if let Ok(content) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(path, content);
+        }
+    }
+}
+
+impl FloatApp {
+    fn save_current_settings(&self) {
+        let settings = AppSettings {
+            selected_backend: *self.selected_backend.lock().unwrap(),
+            baidu_token: self.baidu_token.lock().unwrap().clone(),
+            baidu_model: self.baidu_model.lock().unwrap().clone(),
+            baidu_use_orientation: *self.baidu_use_orientation.lock().unwrap(),
+            baidu_use_unwarping: *self.baidu_use_unwarping.lock().unwrap(),
+            baidu_use_chart: *self.baidu_use_chart.lock().unwrap(),
+        };
+        settings.save();
     }
 }
 
@@ -1248,7 +1442,11 @@ struct FloatApp {
     elapsed: Arc<Mutex<u128>>,
     interval: Arc<Mutex<u128>>,
     selected_backend: Arc<Mutex<BackendType>>,
-    api_url: Arc<Mutex<String>>,
+    baidu_token: Arc<Mutex<String>>,
+    baidu_model: Arc<Mutex<String>>,
+    baidu_use_orientation: Arc<Mutex<bool>>,
+    baidu_use_unwarping: Arc<Mutex<bool>>,
+    baidu_use_chart: Arc<Mutex<bool>>,
 
     // 引擎安装状态（后台检测 / 安装线程写入）
     tess_state:   Arc<Mutex<InstallState>>,
@@ -1475,8 +1673,10 @@ impl eframe::App for FloatApp {
                             }
                         }
                         // 还原到悬浮窗尺寸
+                        let is_baidu = *self.selected_backend.lock().unwrap() == BackendType::BaiduAiStudio;
+                        let h = if is_baidu { 310.0 } else { 260.0 };
                         let size = if self.expanded {
-                            egui::vec2(350.0, 260.0)
+                            egui::vec2(350.0, h)
                         } else {
                             egui::vec2(200.0, 42.0)
                         };
@@ -1487,7 +1687,9 @@ impl eframe::App for FloatApp {
 
                     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                         let size = if self.expanded {
-                            egui::vec2(350.0, 260.0)
+                            let is_baidu = *self.selected_backend.lock().unwrap() == BackendType::BaiduAiStudio;
+                            let h = if is_baidu { 310.0 } else { 260.0 };
+                            egui::vec2(350.0, h)
                         } else {
                             egui::vec2(200.0, 42.0)
                         };
@@ -1533,7 +1735,9 @@ impl eframe::App for FloatApp {
                                 if ui.button(exp_text).clicked() {
                                     self.expanded = !self.expanded;
                                     let size = if self.expanded {
-                                        egui::vec2(350.0, 260.0)
+                                        let is_baidu = *self.selected_backend.lock().unwrap() == BackendType::BaiduAiStudio;
+                                        let h = if is_baidu { 310.0 } else { 260.0 };
+                                        egui::vec2(350.0, h)
                                     } else {
                                         egui::vec2(200.0, 42.0)
                                     };
@@ -1582,6 +1786,7 @@ impl eframe::App for FloatApp {
                                     .selected_text(current_backend.display_name())
                                     .width(100.0)
                                     .show_ui(ui, |ui| {
+                                        ui.label(egui::RichText::new("── 本地 ──").size(10.0).color(egui::Color32::GRAY));
                                         #[cfg(target_os = "windows")]
                                         ui.selectable_value(&mut current_backend, BackendType::WindowsNative, "Windows 原生");
                                         #[cfg(target_os = "macos")]
@@ -1589,10 +1794,17 @@ impl eframe::App for FloatApp {
                                         ui.selectable_value(&mut current_backend, BackendType::Tesseract,    "Tesseract");
                                         ui.selectable_value(&mut current_backend, BackendType::PaddleOcr,    "PaddleOCR");
                                         ui.selectable_value(&mut current_backend, BackendType::RapidOcr,     "RapidOCR");
-                                        ui.selectable_value(&mut current_backend, BackendType::CloudApi,     "自定义 API");
+                                        ui.separator();
+                                        ui.label(egui::RichText::new("── 云端 ──").size(10.0).color(egui::Color32::GRAY));
+                                        ui.selectable_value(&mut current_backend, BackendType::BaiduAiStudio, "百度 AI Studio");
                                     });
                                 if current_backend != prev_backend {
                                     *self.selected_backend.lock().unwrap() = current_backend;
+                                    if self.expanded {
+                                        let h = if current_backend == BackendType::BaiduAiStudio { 310.0 } else { 260.0 };
+                                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(350.0, h)));
+                                    }
+                                    self.save_current_settings();
                                     // 切换引擎时触发检测（若尚未检测）
                                     let need_check = match current_backend {
                                         BackendType::Tesseract => {
@@ -1719,14 +1931,9 @@ impl eframe::App for FloatApp {
                                     }
                                 }
 
-                                // ── CloudApi URL 输入框 ──
-                                if current_backend == BackendType::CloudApi {
-                                    let mut url = self.api_url.lock().unwrap().clone();
-                                    ui.label(egui::RichText::new("URL:").size(11.0).color(egui::Color32::from_rgb(100, 200, 255)));
-                                    if ui.add(egui::TextEdit::singleline(&mut url).desired_width(80.0)).changed() {
-                                        *self.api_url.lock().unwrap() = url;
-                                    }
-                                }
+
+
+
 
                                 // ── 耗时 + 复制（右对齐）──
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1745,6 +1952,60 @@ impl eframe::App for FloatApp {
                                     }
                                 });
                             });
+
+                            if *self.selected_backend.lock().unwrap() == BackendType::BaiduAiStudio {
+                                ui.add_space(2.0);
+                                ui.horizontal(|ui| {
+                                    let mut token = self.baidu_token.lock().unwrap().clone();
+                                    ui.label(egui::RichText::new("Token:").size(11.0).color(egui::Color32::from_rgb(100, 200, 255)));
+                                    if ui.add(egui::TextEdit::singleline(&mut token).desired_width(90.0)).changed() {
+                                        *self.baidu_token.lock().unwrap() = token;
+                                        self.save_current_settings();
+                                    }
+
+                                    ui.add_space(10.0);
+
+                                    let mut model = self.baidu_model.lock().unwrap().clone();
+                                    let prev_model = model.clone();
+                                    ui.label(egui::RichText::new("Model:").size(11.0).color(egui::Color32::from_rgb(100, 200, 255)));
+                                    egui::ComboBox::from_id_source("baidu_model_select")
+                                        .selected_text(model.as_str())
+                                        .width(110.0)
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(&mut model, String::from("PaddleOCR-VL-1.6"), "PaddleOCR-VL-1.6");
+                                        });
+                                    if model != prev_model {
+                                        *self.baidu_model.lock().unwrap() = model;
+                                        self.save_current_settings();
+                                    }
+                                });
+
+                                if *self.baidu_model.lock().unwrap() == "PaddleOCR-VL-1.6" {
+                                    ui.add_space(2.0);
+                                    ui.horizontal(|ui| {
+                                        let mut use_ori = *self.baidu_use_orientation.lock().unwrap();
+                                        let mut use_unw = *self.baidu_use_unwarping.lock().unwrap();
+                                        let mut use_crt = *self.baidu_use_chart.lock().unwrap();
+
+                                        let mut changed = false;
+                                        if ui.checkbox(&mut use_ori, "方向纠正").changed() {
+                                            *self.baidu_use_orientation.lock().unwrap() = use_ori;
+                                            changed = true;
+                                        }
+                                        if ui.checkbox(&mut use_unw, "去畸变").changed() {
+                                            *self.baidu_use_unwarping.lock().unwrap() = use_unw;
+                                            changed = true;
+                                        }
+                                        if ui.checkbox(&mut use_crt, "图表识别").changed() {
+                                            *self.baidu_use_chart.lock().unwrap() = use_crt;
+                                            changed = true;
+                                        }
+                                        if changed {
+                                            self.save_current_settings();
+                                        }
+                                    });
+                                }
+                            }
 
                             ui.add_space(4.0);
 
@@ -1900,21 +2161,13 @@ fn main() -> Result<()> {
     let shared_interval = Arc::new(Mutex::new(1000u128));
     let shared_paused = Arc::new(Mutex::new(true));
     let shared_region = Arc::new(Mutex::new(None));
-    let shared_backend = Arc::new(Mutex::new({
-        #[cfg(target_os = "windows")]
-        {
-            BackendType::WindowsNative
-        }
-        #[cfg(target_os = "macos")]
-        {
-            BackendType::MacNative
-        }
-        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-        {
-            BackendType::Tesseract
-        }
-    }));
-    let shared_api_url = Arc::new(Mutex::new(String::from("http://127.0.0.1:8000/ocr")));
+    let settings = AppSettings::load();
+    let shared_backend = Arc::new(Mutex::new(settings.selected_backend));
+    let shared_baidu_token = Arc::new(Mutex::new(settings.baidu_token));
+    let shared_baidu_model = Arc::new(Mutex::new(settings.baidu_model));
+    let shared_baidu_use_orientation = Arc::new(Mutex::new(settings.baidu_use_orientation));
+    let shared_baidu_use_unwarping = Arc::new(Mutex::new(settings.baidu_use_unwarping));
+    let shared_baidu_use_chart = Arc::new(Mutex::new(settings.baidu_use_chart));
 
     // 引擎安装状态（默认 Unchecked，启动后台线程完成初始检测）
     let shared_tess_state   = Arc::new(Mutex::new(InstallState::Unchecked));
@@ -1938,7 +2191,11 @@ fn main() -> Result<()> {
     let shared_paused_clone = shared_paused.clone();
     let shared_region_clone = shared_region.clone();
     let shared_backend_clone = shared_backend.clone();
-    let shared_api_url_clone = shared_api_url.clone();
+    let shared_baidu_token_clone = shared_baidu_token.clone();
+    let shared_baidu_model_clone = shared_baidu_model.clone();
+    let shared_baidu_use_orientation_clone = shared_baidu_use_orientation.clone();
+    let shared_baidu_use_unwarping_clone = shared_baidu_use_unwarping.clone();
+    let shared_baidu_use_chart_clone = shared_baidu_use_chart.clone();
 
     eframe::run_native(
         "miaocr",
@@ -2040,13 +2297,18 @@ fn main() -> Result<()> {
             let paused_for_thread = shared_paused_clone.clone();
             let region_for_thread = shared_region_clone.clone();
             let backend_for_thread = shared_backend_clone.clone();
-            let api_url_for_thread = shared_api_url_clone.clone();
+            let baidu_token_for_thread = shared_baidu_token_clone.clone();
+            let baidu_model_for_thread = shared_baidu_model_clone.clone();
+            let baidu_use_orientation_for_thread = shared_baidu_use_orientation_clone.clone();
+            let baidu_use_unwarping_for_thread = shared_baidu_use_unwarping_clone.clone();
+            let baidu_use_chart_for_thread = shared_baidu_use_chart_clone.clone();
 
             std::thread::spawn(move || {
                 let mut history = std::collections::VecDeque::with_capacity(10);
                 let mut log_mgr = LogManager::new();
                 let mut last_error: Option<String> = None; // 去重，避免同一错误反复写入运行日志
                 let mut last_region: Option<(i32, i32, u32, u32)> = None;
+                let mut last_active_backend: Option<BackendType> = None;
                 loop {
                     let is_paused = *paused_for_thread.lock().unwrap();
                     let opt_region = *region_for_thread.lock().unwrap();
@@ -2066,9 +2328,28 @@ fn main() -> Result<()> {
                             log_mgr.start_new_file();
                         }
                         let backend = *backend_for_thread.lock().unwrap();
-                        let url = api_url_for_thread.lock().unwrap().clone();
+                        if Some(backend) != last_active_backend {
+                            last_active_backend = Some(backend);
+                            history.clear(); // 切换后端引擎，重置耗时历史以立即使用新引擎的速度
+                        }
+                        let token = baidu_token_for_thread.lock().unwrap().clone();
+                        let model = baidu_model_for_thread.lock().unwrap().clone();
+                        let use_orientation = *baidu_use_orientation_for_thread.lock().unwrap();
+                        let use_unwarping = *baidu_use_unwarping_for_thread.lock().unwrap();
+                        let use_chart = *baidu_use_chart_for_thread.lock().unwrap();
                         let start = std::time::Instant::now();
-                        match ocr_region(x, y, w, h, backend, &url) {
+                        match ocr_region(
+                            x,
+                            y,
+                            w,
+                            h,
+                            backend,
+                            &token,
+                            &model,
+                            use_orientation,
+                            use_unwarping,
+                            use_chart,
+                        ) {
                             Ok(text) => {
                                 let ms = start.elapsed().as_millis();
                                 log_mgr.log(&text, backend);
@@ -2121,7 +2402,11 @@ fn main() -> Result<()> {
                 elapsed: shared_elapsed,
                 interval: shared_interval,
                 selected_backend: shared_backend,
-                api_url: shared_api_url,
+                baidu_token: shared_baidu_token,
+                baidu_model: shared_baidu_model,
+                baidu_use_orientation: shared_baidu_use_orientation,
+                baidu_use_unwarping: shared_baidu_use_unwarping,
+                baidu_use_chart: shared_baidu_use_chart,
                 tess_state:   shared_tess_state,
                 paddle_state: shared_paddle_state,
                 rapid_state:  shared_rapid_state,

@@ -2484,6 +2484,7 @@ dependencies = [
  "image 0.25.10",
  "mouse_position",
  "screenshots",
+ "serde",
  "serde_json",
  "sevenz-rust",
  "windows 0.58.0",
