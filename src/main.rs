@@ -1782,7 +1782,10 @@ impl eframe::App for FloatApp {
 
                         // ── 引擎选择及状态行 ──
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("引擎:").size(13.0).color(egui::Color32::from_rgb(240, 240, 245)));
+                            ui.set_min_height(ui.spacing().interact_size.y);
+                            ui.horizontal_centered(|ui| {
+                                ui.label(egui::RichText::new("引擎:").size(12.0).color(egui::Color32::from_rgb(240, 240, 245)));
+                            });
                             let mut current_backend = *self.selected_backend.lock().unwrap();
                             let prev_backend = current_backend;
                             
@@ -1854,7 +1857,7 @@ impl eframe::App for FloatApp {
                             if let Some(state) = engine_state {
                                 match &state {
                                     InstallState::Unchecked => {
-                                        ui.horizontal(|ui| {
+                                        ui.horizontal_centered(|ui| {
                                             ui.spacing_mut().item_spacing.x = 4.0;
                                             let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
                                             ui.painter().rect_filled(rect, 2.0, egui::Color32::GRAY);
@@ -1862,7 +1865,7 @@ impl eframe::App for FloatApp {
                                         });
                                     }
                                     InstallState::Checking => {
-                                        ui.horizontal(|ui| {
+                                        ui.horizontal_centered(|ui| {
                                             ui.spacing_mut().item_spacing.x = 4.0;
                                             let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
                                             ui.painter().rect_filled(rect, 2.0, egui::Color32::from_rgb(250, 204, 21));
@@ -1870,22 +1873,15 @@ impl eframe::App for FloatApp {
                                         });
                                     }
                                     InstallState::Available => {
-                                        ui.horizontal(|ui| {
+                                        ui.horizontal_centered(|ui| {
                                             ui.spacing_mut().item_spacing.x = 5.0;
                                             let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-                                            // 稍微偏移一点以居中对齐
-                                            let aligned_rect = rect.translate(egui::vec2(0.0, 1.0));
-                                            ui.painter().rect_filled(aligned_rect, 2.0, egui::Color32::from_rgb(34, 197, 94)); // 亮绿
+                                            ui.painter().rect_filled(rect, 2.0, egui::Color32::from_rgb(34, 197, 94)); // 亮绿
                                             ui.label(egui::RichText::new("已安装").size(12.0).color(egui::Color32::from_rgb(74, 222, 128)));
                                         });
                                     }
                                     InstallState::NotInstalled => {
-                                        ui.horizontal(|ui| {
-                                            ui.spacing_mut().item_spacing.x = 4.0;
-                                            let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-                                            let aligned_rect = rect.translate(egui::vec2(0.0, 1.0));
-                                            ui.painter().rect_filled(aligned_rect, 2.0, egui::Color32::from_rgb(248, 113, 113)); // 亮红
-                                            ui.label(egui::RichText::new("未安装").size(12.0).color(egui::Color32::from_rgb(248, 113, 113)));
+                                        ui.horizontal_centered(|ui| {
                                             if ui.small_button("安装").clicked() {
                                                 match current_backend {
                                                     BackendType::Tesseract => start_tesseract_install(self.tess_state.clone(), ui.ctx().clone()),
@@ -1897,19 +1893,40 @@ impl eframe::App for FloatApp {
                                         });
                                     }
                                     InstallState::Installing(msg) => {
-                                        ui.horizontal(|ui| {
+                                        ui.horizontal_centered(|ui| {
                                             ui.spacing_mut().item_spacing.x = 4.0;
                                             let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
                                             ui.painter().rect_filled(rect, 2.0, egui::Color32::from_rgb(250, 204, 21));
-                                            ui.label(egui::RichText::new(format!("⏳ {}", msg)).size(12.0).color(egui::Color32::from_rgb(250, 204, 21)));
+                                            
+                                            let display_msg = if msg.contains("正在下载") {
+                                                if msg.contains("Tesseract") {
+                                                    "下载中 (Tesseract)...".to_string()
+                                                } else if msg.contains("中文语言包") {
+                                                    "下载中 (语言包)...".to_string()
+                                                } else if msg.contains("PaddleOCR") {
+                                                    "下载中 (PaddleOCR)...".to_string()
+                                                } else if msg.contains("RapidOCR") {
+                                                    "下载中 (RapidOCR)...".to_string()
+                                                } else {
+                                                    "下载中...".to_string()
+                                                }
+                                            } else if msg.contains("正在解压") {
+                                                "解压中...".to_string()
+                                            } else if msg.contains("等待 UAC") {
+                                                "等待授权...".to_string()
+                                            } else {
+                                                msg.clone()
+                                            };
+                                            
+                                            ui.label(egui::RichText::new(format!("⏳ {}", display_msg)).size(12.0).color(egui::Color32::from_rgb(250, 204, 21)))
+                                                .on_hover_text(msg.as_str());
                                         });
                                     }
                                     InstallState::Failed(err) => {
-                                        ui.horizontal(|ui| {
+                                        ui.horizontal_centered(|ui| {
                                             ui.spacing_mut().item_spacing.x = 4.0;
                                             let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-                                            let aligned_rect = rect.translate(egui::vec2(0.0, 1.0));
-                                            ui.painter().rect_filled(aligned_rect, 2.0, egui::Color32::from_rgb(248, 113, 113));
+                                            ui.painter().rect_filled(rect, 2.0, egui::Color32::from_rgb(248, 113, 113));
                                             let short = if err.chars().count() > 10 {
                                                 format!("{}…", &err.chars().take(10).collect::<String>())
                                             } else {
