@@ -147,12 +147,14 @@ use std::process::{Child, Command, Stdio};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
+#[allow(dead_code)]
 struct JsonOcrEngine {
     child: Child,
     stdout_reader: BufReader<std::process::ChildStdout>,
     stdin_writer: std::process::ChildStdin,
 }
 
+#[allow(dead_code)]
 impl JsonOcrEngine {
     fn new(exe_path: &Path) -> Result<Self> {
         let exe_dir = exe_path.parent().ok_or_else(|| anyhow::anyhow!("Invalid executable path"))?;
@@ -236,6 +238,7 @@ impl Drop for JsonOcrEngine {
     }
 }
 
+#[allow(dead_code)]
 fn find_paddle_exe() -> Option<PathBuf> {
     let base_dir = app_dir().join("PaddleOCR-json");
     let names = ["PaddleOCR-json.exe", "PaddleOCR_json.exe"];
@@ -261,6 +264,7 @@ fn find_paddle_exe() -> Option<PathBuf> {
     None
 }
 
+#[allow(dead_code)]
 fn find_rapid_exe() -> Option<PathBuf> {
     let base_dir = app_dir().join("RapidOCR-json");
     let names = ["RapidOCR-json.exe", "RapidOCR_json.exe"];
@@ -312,112 +316,128 @@ thread_local! {
 }
 
 fn ocr_paddle(bgra: &[u8], width: u32, height: u32) -> Result<String> {
-    let mut err_opt = None;
-    
-    let res = PADDLE_OCR_ENGINE.with(|cell| {
-        let mut lock = cell.borrow_mut();
-        if lock.is_none() {
-            let exe_path = match find_paddle_exe() {
-                Some(p) => p,
-                None => {
-                    err_opt = Some(anyhow::anyhow!("本地 PaddleOCR 引擎未安装。请在界面中点击「安装」。"));
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (bgra, width, height);
+        return Err(anyhow::anyhow!("PaddleOCR 仅支持 Windows 系统。"));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let mut err_opt = None;
+        
+        let res = PADDLE_OCR_ENGINE.with(|cell| {
+            let mut lock = cell.borrow_mut();
+            if lock.is_none() {
+                let exe_path = match find_paddle_exe() {
+                    Some(p) => p,
+                    None => {
+                        err_opt = Some(anyhow::anyhow!("本地 PaddleOCR 引擎未安装。请在界面中点击「安装」。"));
+                        return None;
+                    }
+                };
+                
+                match JsonOcrEngine::new(&exe_path) {
+                    Ok(engine) => {
+                        *lock = Some(engine);
+                    }
+                    Err(e) => {
+                        err_opt = Some(anyhow::anyhow!("启动 PaddleOCR 引擎失败: {:?}", e));
+                        return None;
+                    }
+                }
+            }
+            
+            let engine = lock.as_mut().unwrap();
+            
+            let temp_path = match save_temp_png(bgra, width, height) {
+                Ok(p) => p,
+                Err(e) => {
+                    err_opt = Some(e);
                     return None;
                 }
             };
             
-            match JsonOcrEngine::new(&exe_path) {
-                Ok(engine) => {
-                    *lock = Some(engine);
-                }
+            let ocr_res = engine.ocr(&temp_path);
+            let _ = std::fs::remove_file(temp_path);
+            
+            match ocr_res {
+                Ok(text) => Some(text),
                 Err(e) => {
-                    err_opt = Some(anyhow::anyhow!("启动 PaddleOCR 引擎失败: {:?}", e));
-                    return None;
+                    *lock = None;
+                    err_opt = Some(e);
+                    None
                 }
             }
+        });
+        
+        if let Some(err) = err_opt {
+            Err(err)
+        } else {
+            Ok(res.unwrap_or_default())
         }
-        
-        let engine = lock.as_mut().unwrap();
-        
-        let temp_path = match save_temp_png(bgra, width, height) {
-            Ok(p) => p,
-            Err(e) => {
-                err_opt = Some(e);
-                return None;
-            }
-        };
-        
-        let ocr_res = engine.ocr(&temp_path);
-        let _ = std::fs::remove_file(temp_path);
-        
-        match ocr_res {
-            Ok(text) => Some(text),
-            Err(e) => {
-                *lock = None;
-                err_opt = Some(e);
-                None
-            }
-        }
-    });
-    
-    if let Some(err) = err_opt {
-        Err(err)
-    } else {
-        Ok(res.unwrap_or_default())
     }
 }
 
 fn ocr_rapid(bgra: &[u8], width: u32, height: u32) -> Result<String> {
-    let mut err_opt = None;
-    
-    let res = RAPID_OCR_ENGINE.with(|cell| {
-        let mut lock = cell.borrow_mut();
-        if lock.is_none() {
-            let exe_path = match find_rapid_exe() {
-                Some(p) => p,
-                None => {
-                    err_opt = Some(anyhow::anyhow!("本地 RapidOCR 引擎未安装。请在界面中点击「安装」。"));
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (bgra, width, height);
+        return Err(anyhow::anyhow!("RapidOCR 仅支持 Windows 系统。"));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let mut err_opt = None;
+        
+        let res = RAPID_OCR_ENGINE.with(|cell| {
+            let mut lock = cell.borrow_mut();
+            if lock.is_none() {
+                let exe_path = match find_rapid_exe() {
+                    Some(p) => p,
+                    None => {
+                        err_opt = Some(anyhow::anyhow!("本地 RapidOCR 引擎未安装。请在界面中点击「安装」。"));
+                        return None;
+                    }
+                };
+                
+                match JsonOcrEngine::new(&exe_path) {
+                    Ok(engine) => {
+                        *lock = Some(engine);
+                    }
+                    Err(e) => {
+                        err_opt = Some(anyhow::anyhow!("启动 RapidOCR 引擎失败: {:?}", e));
+                        return None;
+                    }
+                }
+            }
+            
+            let engine = lock.as_mut().unwrap();
+            
+            let temp_path = match save_temp_png(bgra, width, height) {
+                Ok(p) => p,
+                Err(e) => {
+                    err_opt = Some(e);
                     return None;
                 }
             };
             
-            match JsonOcrEngine::new(&exe_path) {
-                Ok(engine) => {
-                    *lock = Some(engine);
-                }
+            let ocr_res = engine.ocr(&temp_path);
+            let _ = std::fs::remove_file(temp_path);
+            
+            match ocr_res {
+                Ok(text) => Some(text),
                 Err(e) => {
-                    err_opt = Some(anyhow::anyhow!("启动 RapidOCR 引擎失败: {:?}", e));
-                    return None;
+                    *lock = None;
+                    err_opt = Some(e);
+                    None
                 }
             }
+        });
+        
+        if let Some(err) = err_opt {
+            Err(err)
+        } else {
+            Ok(res.unwrap_or_default())
         }
-        
-        let engine = lock.as_mut().unwrap();
-        
-        let temp_path = match save_temp_png(bgra, width, height) {
-            Ok(p) => p,
-            Err(e) => {
-                err_opt = Some(e);
-                return None;
-            }
-        };
-        
-        let ocr_res = engine.ocr(&temp_path);
-        let _ = std::fs::remove_file(temp_path);
-        
-        match ocr_res {
-            Ok(text) => Some(text),
-            Err(e) => {
-                *lock = None;
-                err_opt = Some(e);
-                None
-            }
-        }
-    });
-    
-    if let Some(err) = err_opt {
-        Err(err)
-    } else {
-        Ok(res.unwrap_or_default())
     }
 }
 
@@ -521,7 +541,14 @@ fn ensure_chi_sim() {
 
 /// 检测本地 PaddleOCR 相关的 exe 文件是否存在
 fn detect_paddle() -> bool {
-    find_paddle_exe().is_some()
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+    #[cfg(target_os = "windows")]
+    {
+        find_paddle_exe().is_some()
+    }
 }
 
 /// 后台异步下载安装 PaddleOCR-json 引擎
@@ -614,7 +641,14 @@ fn start_paddle_install(state: Arc<Mutex<InstallState>>, ctx: egui::Context) {
 
 /// 检测本地 RapidOCR 相关的 exe 文件是否存在
 fn detect_rapid() -> bool {
-    find_rapid_exe().is_some()
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+    #[cfg(target_os = "windows")]
+    {
+        find_rapid_exe().is_some()
+    }
 }
 
 /// 后台异步下载安装 RapidOCR-json 引擎
@@ -1799,7 +1833,9 @@ impl eframe::App for FloatApp {
                                     #[cfg(target_os = "macos")]
                                     ui.selectable_value(&mut current_backend, BackendType::MacNative, "macOS 原生");
                                     ui.selectable_value(&mut current_backend, BackendType::Tesseract,    "Tesseract");
+                                    #[cfg(target_os = "windows")]
                                     ui.selectable_value(&mut current_backend, BackendType::PaddleOcr,    "PaddleOCR");
+                                    #[cfg(target_os = "windows")]
                                     ui.selectable_value(&mut current_backend, BackendType::RapidOcr,     "RapidOCR");
                                     ui.separator();
                                     ui.label(egui::RichText::new("── 云端 ──").size(10.0).color(egui::Color32::GRAY));
