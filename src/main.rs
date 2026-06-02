@@ -2009,13 +2009,19 @@ impl eframe::App for FloatApp {
 
                             ui.add_space(4.0);
 
+                            // 识别结果展示区 - 根据引擎类型自动调整高度
                             let text = self.text.lock().unwrap().clone();
+                            let is_baidu = *self.selected_backend.lock().unwrap() == BackendType::BaiduAiStudio;
+                            let text_height = if is_baidu { 150.0 } else { 185.0 };
+                            
                             egui::ScrollArea::vertical()
-                                .max_height(115.0)
+                                .max_height(text_height)
+                                .auto_shrink([false, false])
                                 .show(ui, |ui| {
                                     ui.add(
                                         egui::TextEdit::multiline(&mut text.as_str())
                                             .desired_width(f32::INFINITY)
+                                            .desired_rows(8)
                                             .font(egui::FontId::proportional(14.0)),
                                     );
                                 });
