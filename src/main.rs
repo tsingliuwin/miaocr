@@ -1206,6 +1206,17 @@ impl BackendType {
             BackendType::CloudApi    => "自定义 API",
         }
     }
+
+    fn log_name(&self) -> &'static str {
+        match self {
+            BackendType::WindowsNative => "WindowsNative",
+            BackendType::MacNative     => "MacNative",
+            BackendType::Tesseract     => "Tesseract",
+            BackendType::PaddleOcr     => "PaddleOCR",
+            BackendType::RapidOcr      => "RapidOCR",
+            BackendType::CloudApi      => "CloudAPI",
+        }
+    }
 }
 
 #[derive(PartialEq)]
@@ -1550,6 +1561,8 @@ impl eframe::App for FloatApp {
                                             self.float_pos = rect.min;
                                         }
                                     }
+                                    *self.ocr_region.lock().unwrap() = None;
+                                    *self.paused.lock().unwrap() = true;
                                     self.select_step = 1;
                                 }
                                 sel_btn.on_hover_text("选择识别区域");
@@ -1791,42 +1804,50 @@ struct LogManager {
     last_text: Option<String>,
     last_header_pos: u64,
     start_time: Option<chrono::DateTime<chrono::Local>>,
+    last_backend: Option<BackendType>,
 }
 
 impl LogManager {
     fn new() -> Self {
-        use std::fs::OpenOptions;
-        use std::io::Seek;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open("ocr_log.txt")  // 识别结果写入当前目录，方便用户查看
-            .ok();
-        
-        let mut mgr = Self {
-            file,
+        Self {
+            file: None,
             last_text: None,
             last_header_pos: 0,
             start_time: None,
-        };
-
-        if let Some(ref mut f) = mgr.file {
-            let _ = f.seek(std::io::SeekFrom::End(0));
+            last_backend: None,
         }
-        mgr
+    }
+
+    fn start_new_file(&mut self) {
+        use std::fs::OpenOptions;
+        let _ = std::fs::create_dir_all(".log");
+        let now = chrono::Local::now();
+        let file_name = format!(".log/ocr_log_{}.txt", now.format("%Y%m%d_%H%M%S"));
+        self.file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&file_name)
+            .ok();
+        self.reset();
     }
 
     fn reset(&mut self) {
         self.last_text = None;
         self.last_header_pos = 0;
         self.start_time = None;
+        self.last_backend = None;
     }
 
-    fn log(&mut self, text: &str) {
+    fn log(&mut self, text: &str, backend: BackendType) {
         let text = text.trim();
         if text.is_empty() {
             return;
+        }
+
+        if self.file.is_none() {
+            self.start_new_file();
         }
 
         let file = match &mut self.file {
@@ -1839,12 +1860,12 @@ impl LogManager {
         let time_str = now.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
 
         if let Some(ref last) = self.last_text {
-            if last == text {
-                // 如果结果与之前一样，则定位到上一条记录的头部，覆写结束时间
+            if last == text && self.last_backend == Some(backend) {
+                // 如果结果与之前一样，并且引擎也一样，则定位到上一条记录的头部，覆写结束时间
                 if file.seek(SeekFrom::Start(self.last_header_pos)).is_ok() {
                     let start_str = self.start_time.unwrap().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
-                    // 覆写时间头部，格式和长度必须保持完全一致以避免文本发生位移 (包括毫秒在内恰好 60 字节)
-                    let header = format!("=== [{} ~ {}] ===\r\n", start_str, time_str);
+                    // 覆写时间头部，格式和长度必须保持完全一致以避免文本发生位移
+                    let header = format!("=== [{}] [{} ~ {}] ===\r\n", backend.log_name(), start_str, time_str);
                     let _ = file.write_all(header.as_bytes());
                     let _ = file.flush();
                 }
@@ -1852,7 +1873,7 @@ impl LogManager {
             }
         }
 
-        // 如果结果不同或为新会话，则在文件末尾写入新片段
+        // 如果结果不同、引擎不同或为新会话，则在文件末尾写入新片段
         let _ = file.seek(SeekFrom::End(0));
         if let Ok(pos) = file.stream_position() {
             self.last_header_pos = pos;
@@ -1862,8 +1883,9 @@ impl LogManager {
 
         self.last_text = Some(text.to_string());
         self.start_time = Some(now);
+        self.last_backend = Some(backend);
 
-        let header = format!("=== [{} ~ {}] ===\r\n", time_str, time_str);
+        let header = format!("=== [{}] [{} ~ {}] ===\r\n", backend.log_name(), time_str, time_str);
         let _ = file.write_all(header.as_bytes());
         let _ = file.write_all(text.as_bytes());
         let _ = file.write_all(b"\r\n\r\n");
@@ -2024,8 +2046,13 @@ fn main() -> Result<()> {
                 let mut history = std::collections::VecDeque::with_capacity(10);
                 let mut log_mgr = LogManager::new();
                 let mut last_error: Option<String> = None; // 去重，避免同一错误反复写入运行日志
+                let mut last_region: Option<(i32, i32, u32, u32)> = None;
                 loop {
                     let is_paused = *paused_for_thread.lock().unwrap();
+                    let opt_region = *region_for_thread.lock().unwrap();
+                    if opt_region.is_none() {
+                        last_region = None;
+                    }
                     if is_paused {
                         history.clear();
                         log_mgr.reset();
@@ -2033,15 +2060,18 @@ fn main() -> Result<()> {
                         continue;
                     }
 
-                    let opt_region = *region_for_thread.lock().unwrap();
                     if let Some((x, y, w, h)) = opt_region {
+                        if Some((x, y, w, h)) != last_region {
+                            last_region = Some((x, y, w, h));
+                            log_mgr.start_new_file();
+                        }
                         let backend = *backend_for_thread.lock().unwrap();
                         let url = api_url_for_thread.lock().unwrap().clone();
                         let start = std::time::Instant::now();
                         match ocr_region(x, y, w, h, backend, &url) {
                             Ok(text) => {
                                 let ms = start.elapsed().as_millis();
-                                log_mgr.log(&text);
+                                log_mgr.log(&text, backend);
                                 *text_for_thread.lock().unwrap() = text;
                                 *elapsed_for_thread.lock().unwrap() = ms;
                                 last_error = None; // 成功后重置，下次出错时重新记录
