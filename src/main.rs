@@ -1,4 +1,4 @@
-use anyhow::Result;
+﻿use anyhow::Result;
 use eframe::egui;
 use screenshots::Screen;
 use std::sync::{Arc, Mutex};
@@ -1455,6 +1455,9 @@ struct FloatApp {
 
     // 折叠展开状态
     expanded: bool,
+    
+    // 记忆展开状态下的窗口大小（用户可以拖动调整）
+    expanded_size: egui::Vec2,
 
     // 选区相关的临时截图数据
     screenshot_texture: Option<egui::TextureHandle>,
@@ -1673,10 +1676,8 @@ impl eframe::App for FloatApp {
                             }
                         }
                         // 还原到悬浮窗尺寸
-                        let is_baidu = *self.selected_backend.lock().unwrap() == BackendType::BaiduAiStudio;
-                        let h = if is_baidu { 310.0 } else { 260.0 };
                         let size = if self.expanded {
-                            egui::vec2(350.0, h)
+                            self.expanded_size
                         } else {
                             egui::vec2(200.0, 42.0)
                         };
@@ -1687,9 +1688,7 @@ impl eframe::App for FloatApp {
 
                     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                         let size = if self.expanded {
-                            let is_baidu = *self.selected_backend.lock().unwrap() == BackendType::BaiduAiStudio;
-                            let h = if is_baidu { 310.0 } else { 260.0 };
-                            egui::vec2(350.0, h)
+                            self.expanded_size
                         } else {
                             egui::vec2(200.0, 42.0)
                         };
@@ -1704,7 +1703,7 @@ impl eframe::App for FloatApp {
         if self.mode == AppMode::Float {
             ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::viewport::WindowLevel::AlwaysOnTop));
 
-            // 半透明暗色卡片风格
+            // 半透明暗色卡片风格（内容区域使用，窗口本身使用系统标题栏）
             let card_frame = egui::Frame::none()
                 .fill(egui::Color32::from_rgba_unmultiplied(20, 20, 25, 220))
                 .rounding(egui::Rounding::same(8.0))
@@ -1717,31 +1716,28 @@ impl eframe::App for FloatApp {
                     ui.vertical(|ui| {
                         // 顶部操作栏
                         ui.horizontal(|ui| {
-                            let title_lbl = ui.label(
+                            ui.label(
                                 egui::RichText::new("miaocr")
                                     .strong()
                                     .color(egui::Color32::from_rgb(100, 200, 255)),
                             );
-                            let title_rect = title_lbl.rect;
-                            let drag_res = ui.interact(title_rect, ui.id().with("drag"), egui::Sense::drag());
-                            if drag_res.dragged() {
-                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                            }
-                            drag_res.on_hover_text("按住此处拖拽窗口");
 
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 // 展开 / 收起折叠按钮
                                 let exp_text = if self.expanded { "折叠" } else { "展开" };
                                 if ui.button(exp_text).clicked() {
-                                    self.expanded = !self.expanded;
-                                    let size = if self.expanded {
-                                        let is_baidu = *self.selected_backend.lock().unwrap() == BackendType::BaiduAiStudio;
-                                        let h = if is_baidu { 310.0 } else { 260.0 };
-                                        egui::vec2(350.0, h)
+                                    if self.expanded {
+                                        // 折叠前记住当前窗口大小
+                                        if let Some(rect) = ctx.input(|i| i.viewport().inner_rect) {
+                                            self.expanded_size = rect.size();
+                                        }
+                                        // 折叠到固定小尺寸
+                                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(200.0, 42.0)));
                                     } else {
-                                        egui::vec2(200.0, 42.0)
-                                    };
-                                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                                        // 展开到之前记住的尺寸
+                                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(self.expanded_size));
+                                    }
+                                    self.expanded = !self.expanded;
                                 }
 
                                 // 播放 / 暂停按钮 (只有在有有效选区时才显示)
@@ -1800,10 +1796,6 @@ impl eframe::App for FloatApp {
                                     });
                                 if current_backend != prev_backend {
                                     *self.selected_backend.lock().unwrap() = current_backend;
-                                    if self.expanded {
-                                        let h = if current_backend == BackendType::BaiduAiStudio { 310.0 } else { 260.0 };
-                                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(350.0, h)));
-                                    }
                                     self.save_current_settings();
                                     // 切换引擎时触发检测（若尚未检测）
                                     let need_check = match current_backend {
@@ -2009,20 +2001,19 @@ impl eframe::App for FloatApp {
 
                             ui.add_space(4.0);
 
-                            // 识别结果展示区 - 根据引擎类型自动调整高度
+                            // 识别结果展示区 - 自适应窗口大小
                             let text = self.text.lock().unwrap().clone();
-                            let is_baidu = *self.selected_backend.lock().unwrap() == BackendType::BaiduAiStudio;
-                            let text_height = if is_baidu { 150.0 } else { 185.0 };
                             
+                            // 使用 ScrollArea 包裹，自动占满剩余空间
                             egui::ScrollArea::vertical()
-                                .max_height(text_height)
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
-                                    ui.add(
+                                    // 获取可用空间并填充
+                                    let available = ui.available_size();
+                                    ui.add_sized(
+                                        available,
                                         egui::TextEdit::multiline(&mut text.as_str())
-                                            .desired_width(f32::INFINITY)
-                                            .desired_rows(8)
-                                            .font(egui::FontId::proportional(14.0)),
+                                            .font(egui::FontId::proportional(14.0))
                                     );
                                 });
                         }
@@ -2180,14 +2171,14 @@ fn main() -> Result<()> {
     let shared_paddle_state = Arc::new(Mutex::new(InstallState::Unchecked));
     let shared_rapid_state  = Arc::new(Mutex::new(InstallState::Unchecked));
 
-    // 2. 设定无边框、始终置顶且支持透明背景的悬浮胶囊参数
+    // 2. 设定始终置顶的悬浮窗口参数（使用系统标题栏和边框）
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([200.0, 42.0])
             .with_position([100.0, 100.0])
-            .with_decorations(false)
             .with_always_on_top()
-            .with_transparent(true),
+            .with_resizable(true)  // 允许拖动调整窗口大小
+            .with_min_inner_size([200.0, 42.0]),  // 设置最小尺寸
         ..Default::default()
     };
 
@@ -2417,6 +2408,7 @@ fn main() -> Result<()> {
                 paddle_state: shared_paddle_state,
                 rapid_state:  shared_rapid_state,
                 expanded: false,
+                expanded_size: egui::vec2(350.0, 260.0),  // 默认展开尺寸
                 screenshot_texture: None,
                 screenshot_raw: Vec::new(),
                 screenshot_width: 0,
