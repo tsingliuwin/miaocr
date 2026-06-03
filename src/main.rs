@@ -1773,11 +1773,11 @@ impl BackendType {
             BackendType::WindowsNative => "Windows 原生",
             BackendType::MacNative     => "macOS 原生",
             BackendType::Tesseract    => "Tesseract",
-            BackendType::PaddleOcr   => "PaddleOCR",
-            BackendType::RapidOcr    => "RapidOCR",
+            BackendType::PaddleOcr   => "PaddleOCR-json",
+            BackendType::RapidOcr    => "RapidOCR-json",
             BackendType::BaiduAiStudio => "百度 AI Studio",
-            BackendType::OcrRs        => "PP-OCRv5",
-            BackendType::OarOcr       => "oar-ocr",
+            BackendType::OcrRs        => "PP-OCRv5 (MNN)",
+            BackendType::OarOcr       => "OarOCR (ONNX)",
         }
     }
 
@@ -2178,6 +2178,8 @@ impl eframe::App for FloatApp {
                             ui.set_min_height(ui.spacing().interact_size.y);
                             ui.horizontal_centered(|ui| {
                                 ui.label(egui::RichText::new("引擎:").size(12.0).color(egui::Color32::from_rgb(240, 240, 245)));
+                                ui.label(egui::RichText::new("ℹ").size(12.0).color(egui::Color32::GRAY))
+                                    .on_hover_text("【本地引擎运行模式说明】\n\n• 内置 MNN/ONNX 引擎 (PP-OCRv5 / OarOCR)：\n  - 直接在程序内部加载推理，冷启动和识别可在毫秒级完成，最节省系统资源。\n  - 若底层算法库遭遇致命崩溃，会连带导致主程序闪退。\n\n• 外置子进程引擎 (PaddleOCR-json / RapidOCR-json)：\n  - 独立运行于后台进程中，通过 stdio 管道通信，需首次下载额外引擎包。\n  - 具备崩溃隔离保护，子进程异常崩溃不会影响主程序，但有轻微的跨进程开销。");
                             });
                             let mut current_backend = *self.selected_backend.lock().unwrap();
                             let prev_backend = current_backend;
@@ -2188,19 +2190,27 @@ impl eframe::App for FloatApp {
                                 .show_ui(ui, |ui| {
                                     ui.label(egui::RichText::new("── 本地 ──").size(10.0).color(egui::Color32::GRAY));
                                     #[cfg(target_os = "windows")]
-                                    ui.selectable_value(&mut current_backend, BackendType::WindowsNative, "Windows 原生");
+                                    ui.selectable_value(&mut current_backend, BackendType::WindowsNative, "Windows 原生 (系统自带)")
+                                        .on_hover_text("Windows 原生 OCR：\n• 调用 Windows 系统内置 OCR 引擎\n• 零额外开销，启动极快，支持中英文\n• 推荐在无需高精度排版识别的日常场景下使用");
                                     #[cfg(target_os = "macos")]
-                                    ui.selectable_value(&mut current_backend, BackendType::MacNative, "macOS 原生");
-                                    ui.selectable_value(&mut current_backend, BackendType::Tesseract,    "Tesseract");
-                                    ui.selectable_value(&mut current_backend, BackendType::OcrRs,        "PP-OCRv5");
-                                    ui.selectable_value(&mut current_backend, BackendType::OarOcr,       "oar-ocr");
+                                    ui.selectable_value(&mut current_backend, BackendType::MacNative, "macOS 原生 (系统自带)")
+                                        .on_hover_text("macOS 原生 OCR：\n• 调用 macOS 系统 Vision 框架 API\n• 速度极快，识别率高，无需联网及额外下载");
+                                    ui.selectable_value(&mut current_backend, BackendType::Tesseract,    "Tesseract (传统多语言)")
+                                        .on_hover_text("Tesseract OCR：\n• 经典开源 OCR 引擎\n• 支持极其丰富的多国语言包，适合小语种识别");
+                                    ui.selectable_value(&mut current_backend, BackendType::OcrRs,        "PP-OCRv5 (MNN 内置, 极速)")
+                                        .on_hover_text("PP-OCRv5 (内置 MNN 引擎)：\n• 采用最新 PP-OCRv5 算法，性能和体积平衡极佳\n• 在程序内部加载运行，零跨进程通信延迟，推荐作为离线 OCR 首选");
+                                    ui.selectable_value(&mut current_backend, BackendType::OarOcr,       "OarOCR (ONNX 内置, 兼容好)")
+                                        .on_hover_text("OarOCR (内置 ONNX 引擎)：\n• 使用主程序内置的 ONNX Runtime 进行推理，兼容性与稳定性强\n• 直接在当前进程内加载，冷启动与识别迅速，最省系统资源");
                                     #[cfg(target_os = "windows")]
-                                    ui.selectable_value(&mut current_backend, BackendType::PaddleOcr,    "PaddleOCR");
+                                    ui.selectable_value(&mut current_backend, BackendType::PaddleOcr,    "PaddleOCR-json (Paddle 外置, 高精)")
+                                        .on_hover_text("PaddleOCR-json (外置 Paddle 引擎)：\n• 基于官方 C++ 预测库，独立进程运行，首次切换需下载约 98MB 引擎包\n• 识别精度非常优秀，对段落合并与复杂文本排版支持极佳");
                                     #[cfg(target_os = "windows")]
-                                    ui.selectable_value(&mut current_backend, BackendType::RapidOcr,     "RapidOCR");
+                                    ui.selectable_value(&mut current_backend, BackendType::RapidOcr,     "RapidOCR-json (ONNX 外置, 稳定)")
+                                        .on_hover_text("RapidOCR-json (外置 ONNX 引擎)：\n• 独立子进程运行的 ONNX 推理引擎（RapidOCR-json.exe）\n• 具备“崩溃隔离”优势，子进程异常崩溃绝不影响主程序，稳定性高");
                                     ui.separator();
                                     ui.label(egui::RichText::new("── 云端 ──").size(10.0).color(egui::Color32::GRAY));
-                                    ui.selectable_value(&mut current_backend, BackendType::BaiduAiStudio, "百度 AI Studio");
+                                    ui.selectable_value(&mut current_backend, BackendType::BaiduAiStudio, "百度 AI Studio (高精云端)")
+                                        .on_hover_text("百度 AI Studio (云端 API)：\n• 联网请求百度智能云 OCR 服务\n• 识别精确度最高，对倾斜、手写、复杂表格等效果极佳，需联网和配置 Key");
                                 });
                                 
                             if current_backend != prev_backend {
