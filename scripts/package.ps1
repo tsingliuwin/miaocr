@@ -34,23 +34,31 @@ Write-Host "  Directory ready" -ForegroundColor Green
 
 # 3. Copy required files
 $ReleaseDir = Join-Path $ProjectRoot "target\release"
-$RequiredFiles = @("miaocr.exe", "MNN.dll")
 
+# miaocr.exe is always required
 Write-Host "[3/4] Copying files..." -ForegroundColor Yellow
-foreach ($fname in $RequiredFiles) {
-    $src = Join-Path $ReleaseDir $fname
-    if (-not (Test-Path $src)) {
-        Write-Host "  ERROR: $fname not found!" -ForegroundColor Red
-        exit 1
+$exe = Join-Path $ReleaseDir "miaocr.exe"
+if (-not (Test-Path $exe)) {
+    Write-Host "  ERROR: miaocr.exe not found!" -ForegroundColor Red
+    exit 1
+}
+Copy-Item $exe $DistPath
+$exeSize = [math]::Round((Get-Item $exe).Length / 1MB, 2)
+Write-Host "  miaocr.exe - $exeSize MB" -ForegroundColor Green
+
+# MNN.dll: only needed when using prebuilt MNN (not build-from-source)
+$mnnDll = Join-Path $ReleaseDir "MNN.dll"
+if (Test-Path $mnnDll) {
+    $mnnInfo = Get-Item $mnnDll
+    if ($mnnInfo.Length -gt 0) {
+        Copy-Item $mnnDll $DistPath
+        $mnnSize = [math]::Round($mnnInfo.Length / 1MB, 2)
+        Write-Host "  MNN.dll - $mnnSize MB (dynamic link mode)" -ForegroundColor Yellow
+    } else {
+        Write-Host "  MNN.dll is 0 bytes, skipping (static link mode)" -ForegroundColor DarkGray
     }
-    $fileInfo = Get-Item $src
-    if ($fileInfo.Length -eq 0) {
-        Write-Host "  ERROR: $fname is 0 bytes!" -ForegroundColor Red
-        exit 1
-    }
-    Copy-Item $src $DistPath
-    $sizeMB = [math]::Round($fileInfo.Length / 1MB, 2)
-    Write-Host "  $fname - $sizeMB MB" -ForegroundColor Green
+} else {
+    Write-Host "  MNN.dll not found - static link mode, single exe!" -ForegroundColor Green
 }
 
 # 4. Summary
