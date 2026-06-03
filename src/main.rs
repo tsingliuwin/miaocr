@@ -1269,7 +1269,7 @@ fn start_tesseract_install(state: Arc<Mutex<InstallState>>, ctx: egui::Context) 
             set(InstallState::Available);
         } else {
             set(InstallState::Failed(
-                "安装完成，重启 miaocr 后 Tesseract 即可正常使用。".into()
+                "安装完成，重启 喵OCR 后 Tesseract 即可正常使用。".into()
             ));
         }
     });
@@ -2782,7 +2782,7 @@ fn main() -> Result<()> {
     let shared_baidu_use_chart_clone = shared_baidu_use_chart.clone();
 
     eframe::run_native(
-        "miaocr",
+        "喵OCR",
         options,
         Box::new(move |cc| {
             // 动态加载系统内置中文字体
@@ -2857,7 +2857,7 @@ fn main() -> Result<()> {
                 style.spacing.button_padding = egui::vec2(10.0, 5.0);
                 style.spacing.item_spacing = egui::vec2(10.0, 8.0);
             });
-            runtime_log("=== miaocr 启动 ===");
+            runtime_log("=== 喵OCR 启动 ===");
 
             // 3. 启动引擎环境初始检测线程（启动时静默检测 Tesseract / PaddleOCR / RapidOCR / PP-OCRv5 / oar-ocr）
             {
