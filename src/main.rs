@@ -2851,7 +2851,8 @@ fn main() -> Result<()> {
                 style.visuals.widgets.open.bg_fill = egui::Color32::from_rgb(255, 255, 255);
                 style.visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0, border_color_inactive);
 
-                style.visuals.selection.bg_fill = egui::Color32::from_rgb(59, 130, 246); // Brand blue
+                style.visuals.selection.bg_fill = egui::Color32::from_rgb(219, 234, 254); // Soft pale blue
+                style.visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(29, 78, 216)); // Dark blue text/accent
                 style.visuals.hyperlink_color = egui::Color32::from_rgb(37, 99, 235);
                 
                 style.spacing.button_padding = egui::vec2(10.0, 5.0);
