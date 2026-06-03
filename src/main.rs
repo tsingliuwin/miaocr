@@ -1772,12 +1772,12 @@ impl BackendType {
         match self {
             BackendType::WindowsNative => "Windows 原生",
             BackendType::MacNative     => "macOS 原生",
-            BackendType::Tesseract    => "Tesseract (本地)",
-            BackendType::PaddleOcr   => "PaddleOCR (本地)",
-            BackendType::RapidOcr    => "RapidOCR (本地)",
-            BackendType::BaiduAiStudio => "百度 AI Studio (云端)",
-            BackendType::OcrRs        => "PP-OCRv5 (本地)",
-            BackendType::OarOcr       => "oar-ocr (本地)",
+            BackendType::Tesseract    => "Tesseract",
+            BackendType::PaddleOcr   => "PaddleOCR",
+            BackendType::RapidOcr    => "RapidOCR",
+            BackendType::BaiduAiStudio => "百度 AI Studio",
+            BackendType::OcrRs        => "PP-OCRv5",
+            BackendType::OarOcr       => "oar-ocr",
         }
     }
 
@@ -2192,8 +2192,8 @@ impl eframe::App for FloatApp {
                                     #[cfg(target_os = "macos")]
                                     ui.selectable_value(&mut current_backend, BackendType::MacNative, "macOS 原生");
                                     ui.selectable_value(&mut current_backend, BackendType::Tesseract,    "Tesseract");
-                                    ui.selectable_value(&mut current_backend, BackendType::OcrRs,        "PP-OCRv5 (本地)");
-                                    ui.selectable_value(&mut current_backend, BackendType::OarOcr,       "oar-ocr (本地)");
+                                    ui.selectable_value(&mut current_backend, BackendType::OcrRs,        "PP-OCRv5");
+                                    ui.selectable_value(&mut current_backend, BackendType::OarOcr,       "oar-ocr");
                                     #[cfg(target_os = "windows")]
                                     ui.selectable_value(&mut current_backend, BackendType::PaddleOcr,    "PaddleOCR");
                                     #[cfg(target_os = "windows")]
@@ -2904,6 +2904,7 @@ fn main() -> Result<()> {
                 let mut last_error: Option<String> = None; // 去重，避免同一错误反复写入运行日志
                 let mut last_region: Option<(i32, i32, u32, u32)> = None;
                 let mut last_active_backend: Option<BackendType> = None;
+                let mut just_switched = true;
                 loop {
                     let is_paused = *paused_for_thread.lock().unwrap();
                     let opt_region = *region_for_thread.lock().unwrap();
@@ -2926,6 +2927,7 @@ fn main() -> Result<()> {
                         if Some(backend) != last_active_backend {
                             last_active_backend = Some(backend);
                             history.clear(); // 切换后端引擎，重置耗时历史以立即使用新引擎的速度
+                            just_switched = true;
                         }
                         let token = baidu_token_for_thread.lock().unwrap().clone();
                         let model = baidu_model_for_thread.lock().unwrap().clone();
@@ -2952,10 +2954,14 @@ fn main() -> Result<()> {
                                 *elapsed_for_thread.lock().unwrap() = ms;
                                 last_error = None; // 成功后重置，下次出错时重新记录
 
-                                if history.len() >= 10 {
-                                    history.pop_front();
+                                if just_switched {
+                                    just_switched = false;
+                                } else {
+                                    if history.len() >= 10 {
+                                        history.pop_front();
+                                    }
+                                    history.push_back(ms);
                                 }
-                                history.push_back(ms);
                             }
                             Err(e) => {
                                 let msg = format!("识别失败: {}", e);
