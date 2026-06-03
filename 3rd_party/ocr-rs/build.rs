@@ -745,11 +745,14 @@ fn link_libraries(
         MnnLinkMode::Dynamic => {
             println!("cargo:rustc-link-lib=dylib=MNN");
         }
-        MnnLinkMode::Static | MnnLinkMode::BuildFromSource | MnnLinkMode::Prebuilt => {
+        MnnLinkMode::BuildFromSource | MnnLinkMode::Static => {
+            // Built from source with /MD CRT (or user-provided static lib) — always static link.
+            println!("cargo:rustc-link-lib=static=MNN");
+        }
+        MnnLinkMode::Prebuilt => {
             if os == "windows" {
-                // Link dynamically on Windows: prebuilt MNN_static.lib uses /MT CRT,
-                // but ort prebuilt uses /MD — they cannot coexist (LNK2038).
-                // Use MNN.dll (dynamic, /MD) to avoid CRT conflict.
+                // Prebuilt MNN_static.lib uses /MT CRT, but ort prebuilt uses /MD.
+                // They cannot coexist in one binary (LNK2038). Use MNN.dll (/MD) instead.
                 println!("cargo:rustc-link-lib=dylib=MNN");
             } else {
                 println!("cargo:rustc-link-lib=static=MNN");
