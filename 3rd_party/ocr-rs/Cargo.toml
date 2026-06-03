@@ -73,7 +73,7 @@ vulkan = []
 [lib]
 name = "ocr_rs"
 crate-type = [
-    "dylib",
+    "lib",
 ]
 path = "src/lib.rs"
 

@@ -173,6 +173,30 @@ fn main() {
 
     // Generate Rust bindings
     bind_gen(&manifest_dir_path, &mnn_include_dir, &os, &arch);
+
+    // On Windows, if we use the prebuilt MNN, copy MNN.dll to the target directory
+    if os == "windows" && matches!(link_mode, MnnLinkMode::Prebuilt) {
+        let mnn_dll = mnn_lib_dir[0].join("MNN.dll");
+        if mnn_dll.exists() {
+            if let Ok(out_dir) = env::var("OUT_DIR") {
+                let out_path = PathBuf::from(out_dir);
+                let mut target_dir = out_path.clone();
+                while target_dir.file_name().map(|s| s.to_str().unwrap()) != Some("target") {
+                    if !target_dir.pop() {
+                        break;
+                    }
+                }
+                if let Ok(profile) = env::var("PROFILE") {
+                    let dest_dir = target_dir.join(profile);
+                    if dest_dir.exists() {
+                        let dest_dll = dest_dir.join("MNN.dll");
+                        let _ = fs::copy(&mnn_dll, &dest_dll);
+                        println!("cargo:warning=Copied MNN.dll to {}", dest_dll.display());
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Get MNN include directories for pre-built library mode.
@@ -321,21 +345,8 @@ fn download_prebuilt_mnn(manifest_dir: &Path, asset_name: &str, os: &str) -> Pat
     }
 
     // For Windows, reorganize lib files:
-    // prebuilt has MNN_static.lib -> rename to MNN.lib for static linking
-    if os == "windows" {
-        let lib_dir = extract_dir.join("lib");
-        let static_lib = lib_dir.join("MNN_static.lib");
-        let mnn_lib = lib_dir.join("MNN.lib");
-        if static_lib.exists() {
-            // MNN.lib from prebuilt is the import lib for DLL, we want the static one
-            // Backup the import lib and replace with static lib
-            let import_lib = lib_dir.join("MNN_import.lib");
-            if mnn_lib.exists() {
-                let _ = fs::rename(&mnn_lib, &import_lib);
-            }
-            fs::copy(&static_lib, &mnn_lib).expect("Failed to copy MNN_static.lib to MNN.lib");
-        }
-    }
+    // We link dynamically on Windows to avoid CRT mismatch with ONNX Runtime.
+    // So we do NOT replace MNN.lib with MNN_static.lib.
 
     // Remove dynamic libraries to force static linking.
     // On macOS the linker prefers .dylib over .a even with `static=MNN`.
@@ -351,7 +362,8 @@ fn remove_dynamic_libs(extract_dir: &Path) {
         for entry in entries.flatten() {
             let path = entry.path();
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.ends_with(".dylib") || name.ends_with(".so") || name.ends_with(".dll") {
+                // Keep .dll on Windows for dynamic linking
+                if name.ends_with(".dylib") || name.ends_with(".so") {
                     let _ = fs::remove_file(&path);
                 }
             }
@@ -685,7 +697,7 @@ fn build_wrapper(
     manifest_dir: &PathBuf,
     mnn_include_dirs: &[PathBuf],
     os: &str,
-    link_mode: &MnnLinkMode,
+    _link_mode: &MnnLinkMode,
 ) {
     let wrapper_file = manifest_dir.join("cpp/src/mnn_wrapper.cpp");
 
@@ -706,10 +718,7 @@ fn build_wrapper(
     // Platform-specific C++ flags
     if os == "windows" {
         build.flag("/std:c++14").flag("/EHsc").flag("/W3");
-        // Match CRT with prebuilt MNN: prebuilt uses /MT (static CRT)
-        if matches!(link_mode, MnnLinkMode::Prebuilt) {
-            build.static_crt(true);
-        }
+        // We link MNN dynamically on Windows (using /MD), so do NOT set static_crt(true)
     } else {
         build.flag("-std=c++14").flag("-fvisibility=hidden");
     }
@@ -739,7 +748,12 @@ fn link_libraries(
             println!("cargo:rustc-link-lib=dylib=MNN");
         }
         MnnLinkMode::Static | MnnLinkMode::BuildFromSource | MnnLinkMode::Prebuilt => {
-            println!("cargo:rustc-link-lib=static=MNN");
+            if os == "windows" {
+                // Link dynamically on Windows to avoid CRT conflicts with ONNX Runtime (/MD)
+                println!("cargo:rustc-link-lib=dylib=MNN");
+            } else {
+                println!("cargo:rustc-link-lib=static=MNN");
+            }
         }
     }
 
