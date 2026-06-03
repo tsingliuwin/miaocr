@@ -1863,13 +1863,13 @@ impl FloatApp {
             if ui.button("⬅ 返回").clicked() {
                 self.show_settings = false;
             }
-            ui.heading(egui::RichText::new("云端配置").strong().color(egui::Color32::WHITE).size(14.0));
+            ui.heading(egui::RichText::new("云端配置").strong().color(egui::Color32::from_rgb(17, 24, 39)).size(14.0));
         });
         
         ui.add_space(6.0);
         
         // 极细分割线
-        let stroke_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 15);
+        let stroke_color = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 20);
         let cursor_y = ui.cursor().min.y;
         let width = ui.available_width();
         ui.painter().hline(
@@ -1884,11 +1884,11 @@ impl FloatApp {
             .show(ui, |ui| {
                 ui.group(|ui| {
                     ui.vertical(|ui| {
-                        ui.label(egui::RichText::new("百度 AI Studio (云端 API)").strong().size(13.0).color(egui::Color32::WHITE));
+                        ui.label(egui::RichText::new("百度 AI Studio (云端 API)").strong().size(13.0).color(egui::Color32::from_rgb(17, 24, 39)));
                         ui.add_space(6.0);
                         
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Token:").size(12.0).color(egui::Color32::from_rgb(200, 200, 200)));
+                            ui.label(egui::RichText::new("Token:").size(12.0).color(egui::Color32::from_rgb(75, 85, 99)));
                             let mut token = self.baidu_token.lock().unwrap().clone();
                             let token_edit = egui::TextEdit::singleline(&mut token)
                                 .password(true)
@@ -1902,7 +1902,7 @@ impl FloatApp {
                         ui.add_space(6.0);
                         
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("模型:").size(12.0).color(egui::Color32::from_rgb(200, 200, 200)));
+                            ui.label(egui::RichText::new("模型:").size(12.0).color(egui::Color32::from_rgb(75, 85, 99)));
                             let mut model = self.baidu_model.lock().unwrap().clone();
                             let prev_model = model.clone();
                             egui::ComboBox::from_id_source("settings_baidu_model_select")
@@ -1946,11 +1946,11 @@ impl FloatApp {
                 });
                 
                 ui.add_space(12.0);
-                ui.label(egui::RichText::new("云端配置说明：").strong().size(12.0).color(egui::Color32::WHITE));
+                ui.label(egui::RichText::new("云端配置说明：").strong().size(12.0).color(egui::Color32::from_rgb(55, 65, 81)));
                 ui.label(egui::RichText::new("• 百度 AI Studio 为云端识别服务，使用时请确保您的网络正常连通。")
-                    .size(11.0).color(egui::Color32::GRAY));
+                    .size(11.0).color(egui::Color32::from_rgb(107, 114, 128)));
                 ui.label(egui::RichText::new("• Token 为您在百度智能云控制台获取的 API 密钥或 Access Token，在本地加密保存。")
-                    .size(11.0).color(egui::Color32::GRAY));
+                    .size(11.0).color(egui::Color32::from_rgb(107, 114, 128)));
             });
     }
 
@@ -1959,8 +1959,8 @@ impl FloatApp {
         ui.horizontal(|ui| {
             ui.set_min_height(ui.spacing().interact_size.y);
             ui.horizontal_centered(|ui| {
-                ui.label(egui::RichText::new("引擎:").size(12.0).color(egui::Color32::from_rgb(240, 240, 245)));
-                ui.label(egui::RichText::new("ℹ").size(12.0).color(egui::Color32::GRAY))
+                ui.label(egui::RichText::new("引擎:").size(12.0).color(egui::Color32::from_rgb(55, 65, 81)));
+                ui.label(egui::RichText::new("ℹ").size(12.0).color(egui::Color32::from_rgb(156, 163, 175)))
                     .on_hover_text("【本地引擎运行模式说明】\n\n• 内置 MNN/ONNX 引擎 (PP-OCRv5 / OarOCR)：\n  - 直接在程序内部加载推理，冷启动和识别可在毫秒级完成，最节省系统资源。\n  - 若底层算法库遭遇致命崩溃，会连带导致主程序闪退。\n\n• 外置子进程引擎 (PaddleOCR-json / RapidOCR-json)：\n  - 独立运行于后台进程中，通过 stdio 管道通信，需首次下载额外引擎包。\n  - 具备崩溃隔离保护，子进程异常崩溃不会影响主程序，但有轻微的跨进程开销。");
             });
             let mut current_backend = *self.selected_backend.lock().unwrap();
@@ -1970,7 +1970,7 @@ impl FloatApp {
                 .selected_text(current_backend.display_name())
                 .width(120.0)
                 .show_ui(ui, |ui| {
-                    ui.label(egui::RichText::new("── 本地 ──").size(10.0).color(egui::Color32::GRAY));
+                    ui.label(egui::RichText::new("── 本地 ──").size(10.0).color(egui::Color32::from_rgb(120, 120, 120)));
                     #[cfg(target_os = "windows")]
                     ui.selectable_value(&mut current_backend, BackendType::WindowsNative, "Windows 原生 (系统自带)")
                         .on_hover_text("Windows 原生 OCR：\n• 调用 Windows 系统内置 OCR 引擎\n• 零额外开销，启动极快，支持中英文\n• 推荐在无需高精度排版识别的日常场景下使用");
@@ -1990,7 +1990,7 @@ impl FloatApp {
                     ui.selectable_value(&mut current_backend, BackendType::RapidOcr,     "RapidOCR-json (ONNX 外置, 稳定)")
                         .on_hover_text("RapidOCR-json (外置 ONNX 引擎)：\n• 独立子进程运行的 ONNX 推理引擎（RapidOCR-json.exe）\n• 具备“崩溃隔离”优势，子进程异常崩溃绝不影响主程序，稳定性高");
                     ui.separator();
-                    ui.label(egui::RichText::new("── 云端 ──").size(10.0).color(egui::Color32::GRAY));
+                    ui.label(egui::RichText::new("── 云端 ──").size(10.0).color(egui::Color32::from_rgb(120, 120, 120)));
                     ui.selectable_value(&mut current_backend, BackendType::BaiduAiStudio, "百度 AI Studio (高精云端)")
                         .on_hover_text("百度 AI Studio (云端 API)：\n• 联网请求百度智能云 OCR 服务\n• 识别精确度最高，对倾斜、手写、复杂表格等效果极佳，需联网和配置 Key");
                 });
@@ -2063,8 +2063,8 @@ impl FloatApp {
                         ui.horizontal_centered(|ui| {
                             ui.spacing_mut().item_spacing.x = 4.0;
                             let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-                            ui.painter().rect_filled(rect, 2.0, egui::Color32::GRAY);
-                            ui.label(egui::RichText::new("未检测").size(12.0).color(egui::Color32::GRAY));
+                            ui.painter().rect_filled(rect, 2.0, egui::Color32::from_rgb(156, 163, 175));
+                            ui.label(egui::RichText::new("未检测").size(12.0).color(egui::Color32::from_rgb(107, 114, 128)));
                         });
                     }
                     InstallState::Checking => {
@@ -2072,7 +2072,7 @@ impl FloatApp {
                             ui.spacing_mut().item_spacing.x = 4.0;
                             let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
                             ui.painter().rect_filled(rect, 2.0, egui::Color32::from_rgb(250, 204, 21));
-                            ui.label(egui::RichText::new("检测中").size(12.0).color(egui::Color32::from_rgb(250, 204, 21)));
+                            ui.label(egui::RichText::new("检测中").size(12.0).color(egui::Color32::from_rgb(180, 83, 9)));
                         });
                     }
                     InstallState::Available => {
@@ -2080,7 +2080,7 @@ impl FloatApp {
                             ui.spacing_mut().item_spacing.x = 5.0;
                             let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
                             ui.painter().rect_filled(rect, 2.0, egui::Color32::from_rgb(34, 197, 94));
-                            ui.label(egui::RichText::new("已安装").size(12.0).color(egui::Color32::from_rgb(74, 222, 128)));
+                            ui.label(egui::RichText::new("已安装").size(12.0).color(egui::Color32::from_rgb(21, 128, 61)));
                         });
                     }
                     InstallState::NotInstalled => {
@@ -2129,7 +2129,7 @@ impl FloatApp {
                                 msg.clone()
                             };
                             
-                            ui.label(egui::RichText::new(format!("⏳ {}", display_msg)).size(12.0).color(egui::Color32::from_rgb(250, 204, 21)))
+                            ui.label(egui::RichText::new(format!("⏳ {}", display_msg)).size(12.0).color(egui::Color32::from_rgb(180, 83, 9)))
                                 .on_hover_text(msg.as_str());
                         });
                     }
@@ -2137,13 +2137,13 @@ impl FloatApp {
                         ui.horizontal_centered(|ui| {
                             ui.spacing_mut().item_spacing.x = 4.0;
                             let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-                            ui.painter().rect_filled(rect, 2.0, egui::Color32::from_rgb(248, 113, 113));
+                            ui.painter().rect_filled(rect, 2.0, egui::Color32::from_rgb(220, 38, 38));
                             let short = if err.chars().count() > 10 {
                                 format!("{}…", &err.chars().take(10).collect::<String>())
                             } else {
                                 err.clone()
                             };
-                            ui.label(egui::RichText::new(format!("安装失败 ({})", short)).size(12.0).color(egui::Color32::from_rgb(248, 113, 113)))
+                            ui.label(egui::RichText::new(format!("安装失败 ({})", short)).size(12.0).color(egui::Color32::from_rgb(220, 38, 38)))
                                 .on_hover_text(err.as_str());
                             if ui.small_button("重试").clicked() {
                                 match current_backend {
@@ -2170,7 +2170,7 @@ impl FloatApp {
         });
 
         ui.add_space(6.0);
-        let stroke_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 15);
+        let stroke_color = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 20);
         let cursor_y = ui.cursor().min.y;
         let width = ui.available_width();
         ui.painter().hline(
@@ -2248,19 +2248,19 @@ impl FloatApp {
                 ui.label(
                     egui::RichText::new("暂无识别内容")
                         .strong()
-                        .color(egui::Color32::from_rgb(209, 213, 219))
+                        .color(egui::Color32::from_rgb(75, 85, 99))
                         .size(13.0)
                 );
                 ui.add_space(2.0);
                 ui.label(
                     egui::RichText::new("点击左上角「🎯选区」开始框选识别")
-                        .color(egui::Color32::from_rgb(156, 163, 175))
+                        .color(egui::Color32::from_rgb(107, 114, 128))
                         .size(11.0)
                 );
                 ui.add_space(4.0);
                 ui.label(
                     egui::RichText::new("提示: 选区时按 Esc 可退出")
-                        .color(egui::Color32::from_rgb(107, 114, 128))
+                        .color(egui::Color32::from_rgb(156, 163, 175))
                         .size(10.0)
                 );
                 ui.add_space(15.0);
@@ -2274,7 +2274,7 @@ impl FloatApp {
                         available,
                         egui::TextEdit::multiline(&mut *text_lock)
                             .font(egui::FontId::proportional(13.0))
-                            .text_color(egui::Color32::from_rgb(229, 231, 235))
+                            .text_color(egui::Color32::from_rgb(17, 24, 39))
                             .frame(false),
                     );
                 });
@@ -2588,9 +2588,9 @@ impl eframe::App for FloatApp {
         if self.mode == AppMode::Float {
             ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::viewport::WindowLevel::AlwaysOnTop));
 
-            // 半透明暗色卡片风格（内容区域使用，窗口本身使用系统标题栏）
+            // 半透明亮色卡片风格（内容区域使用，窗口本身使用系统标题栏）
             let card_frame = egui::Frame::none()
-                .fill(egui::Color32::from_rgba_unmultiplied(20, 20, 25, 230))
+                .fill(egui::Color32::from_rgb(243, 243, 243))
                 .inner_margin(egui::Margin::symmetric(12.0, 10.0));
 
             egui::CentralPanel::default()
@@ -2817,42 +2817,42 @@ fn main() -> Result<()> {
                     .insert(0, "chinese".to_owned());
                 cc.egui_ctx.set_fonts(fonts);
             }
-            cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            cc.egui_ctx.set_visuals(egui::Visuals::light());
             cc.egui_ctx.style_mut(|style| {
                 style.visuals.window_rounding = 8.0.into();
                 
-                let border_color_inactive = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 25);
-                let border_color_hovered = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 50);
-                let border_color_active = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 75);
+                let border_color_inactive = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 20);
+                let border_color_hovered = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 40);
+                let border_color_active = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 60);
                 
-                let bg_color_inactive = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 12);
-                let bg_color_hovered = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 25);
-                let bg_color_active = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 35);
+                let bg_color_inactive = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 8);
+                let bg_color_hovered = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 16);
+                let bg_color_active = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 24);
                 
                 style.visuals.widgets.inactive.bg_fill = bg_color_inactive;
                 style.visuals.widgets.inactive.weak_bg_fill = bg_color_inactive;
                 style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, border_color_inactive);
                 style.visuals.widgets.inactive.rounding = egui::Rounding::same(6.0);
-                style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(220, 220, 225));
+                style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(55, 65, 81));
                 
                 style.visuals.widgets.hovered.bg_fill = bg_color_hovered;
                 style.visuals.widgets.hovered.weak_bg_fill = bg_color_hovered;
                 style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, border_color_hovered);
                 style.visuals.widgets.hovered.rounding = egui::Rounding::same(6.0);
-                style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+                style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(17, 24, 39));
                 
                 style.visuals.widgets.active.bg_fill = bg_color_active;
                 style.visuals.widgets.active.weak_bg_fill = bg_color_active;
                 style.visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, border_color_active);
                 style.visuals.widgets.active.rounding = egui::Rounding::same(6.0);
-                style.visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+                style.visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(17, 24, 39));
 
                 style.visuals.widgets.open.rounding = egui::Rounding::same(6.0);
-                style.visuals.widgets.open.bg_fill = egui::Color32::from_rgb(30, 30, 35);
+                style.visuals.widgets.open.bg_fill = egui::Color32::from_rgb(255, 255, 255);
                 style.visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0, border_color_inactive);
 
                 style.visuals.selection.bg_fill = egui::Color32::from_rgb(59, 130, 246); // Brand blue
-                style.visuals.hyperlink_color = egui::Color32::from_rgb(96, 165, 250);
+                style.visuals.hyperlink_color = egui::Color32::from_rgb(37, 99, 235);
                 
                 style.spacing.button_padding = egui::vec2(10.0, 5.0);
                 style.spacing.item_spacing = egui::vec2(10.0, 8.0);
