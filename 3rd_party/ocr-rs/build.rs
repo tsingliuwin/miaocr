@@ -174,7 +174,7 @@ fn main() {
     // Generate Rust bindings
     bind_gen(&manifest_dir_path, &mnn_include_dir, &os, &arch);
 
-    // On Windows, if we use the prebuilt MNN, copy MNN.dll to the target directory
+    // On Windows, copy MNN.dll to the target output directory so the exe can find it.
     if os == "windows" && matches!(link_mode, MnnLinkMode::Prebuilt) {
         let mnn_dll = mnn_lib_dir[0].join("MNN.dll");
         if mnn_dll.exists() {
@@ -344,13 +344,11 @@ fn download_prebuilt_mnn(manifest_dir: &Path, asset_name: &str, os: &str) -> Pat
         );
     }
 
-    // For Windows, reorganize lib files:
-    // We link dynamically on Windows to avoid CRT mismatch with ONNX Runtime.
-    // So we do NOT replace MNN.lib with MNN_static.lib.
-
-    // Remove dynamic libraries to force static linking.
-    // On macOS the linker prefers .dylib over .a even with `static=MNN`.
-    remove_dynamic_libs(&extract_dir);
+    // For Windows: prebuilt MNN_static.lib uses /MT CRT, but ort prebuilt uses /MD.
+    // These two CRTs cannot coexist in the same binary (LNK2038).
+    // To statically link MNN on Windows, you must build from source with /MD:
+    //   set features = ["build-mnn-from-source"] in the dependency.
+    // For now, we use the prebuilt MNN.dll (dynamic, /MD compatible).
 
     extract_dir
 }
@@ -362,7 +360,7 @@ fn remove_dynamic_libs(extract_dir: &Path) {
         for entry in entries.flatten() {
             let path = entry.path();
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                // Keep .dll on Windows for dynamic linking
+                // Keep .dll on Windows — needed for dynamic linking with MNN.dll
                 if name.ends_with(".dylib") || name.ends_with(".so") {
                     let _ = fs::remove_file(&path);
                 }
@@ -718,7 +716,7 @@ fn build_wrapper(
     // Platform-specific C++ flags
     if os == "windows" {
         build.flag("/std:c++14").flag("/EHsc").flag("/W3");
-        // We link MNN dynamically on Windows (using /MD), so do NOT set static_crt(true)
+        // We link MNN dynamically on Windows (/MD), do NOT set static_crt(true)
     } else {
         build.flag("-std=c++14").flag("-fvisibility=hidden");
     }
@@ -749,7 +747,9 @@ fn link_libraries(
         }
         MnnLinkMode::Static | MnnLinkMode::BuildFromSource | MnnLinkMode::Prebuilt => {
             if os == "windows" {
-                // Link dynamically on Windows to avoid CRT conflicts with ONNX Runtime (/MD)
+                // Link dynamically on Windows: prebuilt MNN_static.lib uses /MT CRT,
+                // but ort prebuilt uses /MD — they cannot coexist (LNK2038).
+                // Use MNN.dll (dynamic, /MD) to avoid CRT conflict.
                 println!("cargo:rustc-link-lib=dylib=MNN");
             } else {
                 println!("cargo:rustc-link-lib=static=MNN");
