@@ -1857,6 +1857,429 @@ impl FloatApp {
         };
         settings.save();
     }
+
+    fn draw_settings_page(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui.button("⬅ 返回").clicked() {
+                self.show_settings = false;
+            }
+            ui.heading(egui::RichText::new("云端配置").strong().color(egui::Color32::WHITE).size(14.0));
+        });
+        
+        ui.add_space(6.0);
+        
+        // 极细分割线
+        let stroke_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 15);
+        let cursor_y = ui.cursor().min.y;
+        let width = ui.available_width();
+        ui.painter().hline(
+            ui.cursor().min.x..=(ui.cursor().min.x + width),
+            cursor_y,
+            egui::Stroke::new(1.0, stroke_color),
+        );
+        ui.add_space(8.0);
+        
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.group(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(egui::RichText::new("百度 AI Studio (云端 API)").strong().size(13.0).color(egui::Color32::WHITE));
+                        ui.add_space(6.0);
+                        
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Token:").size(12.0).color(egui::Color32::from_rgb(200, 200, 200)));
+                            let mut token = self.baidu_token.lock().unwrap().clone();
+                            let token_edit = egui::TextEdit::singleline(&mut token)
+                                .password(true)
+                                .desired_width(180.0);
+                            if ui.add(token_edit).changed() {
+                                *self.baidu_token.lock().unwrap() = token;
+                                self.save_current_settings();
+                            }
+                        });
+                        
+                        ui.add_space(6.0);
+                        
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("模型:").size(12.0).color(egui::Color32::from_rgb(200, 200, 200)));
+                            let mut model = self.baidu_model.lock().unwrap().clone();
+                            let prev_model = model.clone();
+                            egui::ComboBox::from_id_source("settings_baidu_model_select")
+                                .selected_text(model.as_str())
+                                .width(150.0)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut model, String::from("PaddleOCR-VL-1.6"), "PaddleOCR-VL-1.6");
+                                });
+                            if model != prev_model {
+                                *self.baidu_model.lock().unwrap() = model;
+                                self.save_current_settings();
+                            }
+                        });
+                        
+                        if *self.baidu_model.lock().unwrap() == "PaddleOCR-VL-1.6" {
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                let mut use_ori = *self.baidu_use_orientation.lock().unwrap();
+                                let mut use_unw = *self.baidu_use_unwarping.lock().unwrap();
+                                let mut use_crt = *self.baidu_use_chart.lock().unwrap();
+
+                                let mut changed = false;
+                                if ui.checkbox(&mut use_ori, "方向").changed() {
+                                    *self.baidu_use_orientation.lock().unwrap() = use_ori;
+                                    changed = true;
+                                }
+                                if ui.checkbox(&mut use_unw, "去畸变").changed() {
+                                    *self.baidu_use_unwarping.lock().unwrap() = use_unw;
+                                    changed = true;
+                                }
+                                if ui.checkbox(&mut use_crt, "图表").changed() {
+                                    *self.baidu_use_chart.lock().unwrap() = use_crt;
+                                    changed = true;
+                                }
+                                if changed {
+                                    self.save_current_settings();
+                                }
+                            });
+                        }
+                    });
+                });
+                
+                ui.add_space(12.0);
+                ui.label(egui::RichText::new("云端配置说明：").strong().size(12.0).color(egui::Color32::WHITE));
+                ui.label(egui::RichText::new("• 百度 AI Studio 为云端识别服务，使用时请确保您的网络正常连通。")
+                    .size(11.0).color(egui::Color32::GRAY));
+                ui.label(egui::RichText::new("• Token 为您在百度智能云控制台获取的 API 密钥或 Access Token，在本地加密保存。")
+                    .size(11.0).color(egui::Color32::GRAY));
+            });
+    }
+
+    fn draw_main_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        // ── 引擎选择及状态行 (移至顶部) ──
+        ui.horizontal(|ui| {
+            ui.set_min_height(ui.spacing().interact_size.y);
+            ui.horizontal_centered(|ui| {
+                ui.label(egui::RichText::new("引擎:").size(12.0).color(egui::Color32::from_rgb(240, 240, 245)));
+                ui.label(egui::RichText::new("ℹ").size(12.0).color(egui::Color32::GRAY))
+                    .on_hover_text("【本地引擎运行模式说明】\n\n• 内置 MNN/ONNX 引擎 (PP-OCRv5 / OarOCR)：\n  - 直接在程序内部加载推理，冷启动和识别可在毫秒级完成，最节省系统资源。\n  - 若底层算法库遭遇致命崩溃，会连带导致主程序闪退。\n\n• 外置子进程引擎 (PaddleOCR-json / RapidOCR-json)：\n  - 独立运行于后台进程中，通过 stdio 管道通信，需首次下载额外引擎包。\n  - 具备崩溃隔离保护，子进程异常崩溃不会影响主程序，但有轻微的跨进程开销。");
+            });
+            let mut current_backend = *self.selected_backend.lock().unwrap();
+            let prev_backend = current_backend;
+            
+            egui::ComboBox::from_id_source("backend_select")
+                .selected_text(current_backend.display_name())
+                .width(120.0)
+                .show_ui(ui, |ui| {
+                    ui.label(egui::RichText::new("── 本地 ──").size(10.0).color(egui::Color32::GRAY));
+                    #[cfg(target_os = "windows")]
+                    ui.selectable_value(&mut current_backend, BackendType::WindowsNative, "Windows 原生 (系统自带)")
+                        .on_hover_text("Windows 原生 OCR：\n• 调用 Windows 系统内置 OCR 引擎\n• 零额外开销，启动极快，支持中英文\n• 推荐在无需高精度排版识别的日常场景下使用");
+                    #[cfg(target_os = "macos")]
+                    ui.selectable_value(&mut current_backend, BackendType::MacNative, "macOS 原生 (系统自带)")
+                        .on_hover_text("macOS 原生 OCR：\n• 调用 macOS 系统 Vision 框架 API\n• 速度极快，识别率高，无需联网及额外下载");
+                    ui.selectable_value(&mut current_backend, BackendType::Tesseract,    "Tesseract (传统多语言)")
+                        .on_hover_text("Tesseract OCR：\n• 经典开源 OCR 引擎\n• 支持极其丰富的多国语言包，适合小语种识别");
+                    ui.selectable_value(&mut current_backend, BackendType::OcrRs,        "PP-OCRv5 (MNN 内置, 极速)")
+                        .on_hover_text("PP-OCRv5 (内置 MNN 引擎)：\n• 采用最新 PP-OCRv5 算法，性能和体积平衡极佳\n• 在程序内部加载运行，零跨进程通信延迟，推荐作为离线 OCR 首选");
+                    ui.selectable_value(&mut current_backend, BackendType::OarOcr,       "OarOCR (ONNX 内置, 兼容好)")
+                        .on_hover_text("OarOCR (内置 ONNX 引擎)：\n• 使用主程序内置的 ONNX Runtime 进行推理，兼容性与稳定性强\n• 直接在当前进程内加载，冷启动与识别迅速，最省系统资源");
+                    #[cfg(target_os = "windows")]
+                    ui.selectable_value(&mut current_backend, BackendType::PaddleOcr,    "PaddleOCR-json (Paddle 外置, 高精)")
+                        .on_hover_text("PaddleOCR-json (外置 Paddle 引擎)：\n• 基于官方 C++ 预测库，独立进程运行，首次切换需下载约 98MB 引擎包\n• 识别精度非常优秀，对段落合并与复杂文本排版支持极佳");
+                    #[cfg(target_os = "windows")]
+                    ui.selectable_value(&mut current_backend, BackendType::RapidOcr,     "RapidOCR-json (ONNX 外置, 稳定)")
+                        .on_hover_text("RapidOCR-json (外置 ONNX 引擎)：\n• 独立子进程运行的 ONNX 推理引擎（RapidOCR-json.exe）\n• 具备“崩溃隔离”优势，子进程异常崩溃绝不影响主程序，稳定性高");
+                    ui.separator();
+                    ui.label(egui::RichText::new("── 云端 ──").size(10.0).color(egui::Color32::GRAY));
+                    ui.selectable_value(&mut current_backend, BackendType::BaiduAiStudio, "百度 AI Studio (高精云端)")
+                        .on_hover_text("百度 AI Studio (云端 API)：\n• 联网请求百度智能云 OCR 服务\n• 识别精确度最高，对倾斜、手写、复杂表格等效果极佳，需联网和配置 Key");
+                });
+                
+            if current_backend != prev_backend {
+                *self.selected_backend.lock().unwrap() = current_backend;
+                self.save_current_settings();
+                // 切换引擎时触发检测（若尚未检测）
+                let need_check = match current_backend {
+                    BackendType::Tesseract => {
+                        *self.tess_state.lock().unwrap() == InstallState::Unchecked
+                    }
+                    BackendType::PaddleOcr => {
+                        *self.paddle_state.lock().unwrap() == InstallState::Unchecked
+                    }
+                    BackendType::RapidOcr => {
+                        *self.rapid_state.lock().unwrap() == InstallState::Unchecked
+                    }
+                    BackendType::OcrRs => {
+                        *self.ocr_rs_state.lock().unwrap() == InstallState::Unchecked
+                    }
+                    BackendType::OarOcr => {
+                        *self.oar_ocr_state.lock().unwrap() == InstallState::Unchecked
+                    }
+                    _ => false,
+                };
+                if need_check {
+                    let (state_arc, ctx_clone) = match current_backend {
+                        BackendType::Tesseract => (self.tess_state.clone(), ctx.clone()),
+                        BackendType::PaddleOcr => (self.paddle_state.clone(), ctx.clone()),
+                        BackendType::RapidOcr => (self.rapid_state.clone(), ctx.clone()),
+                        BackendType::OcrRs => (self.ocr_rs_state.clone(), ctx.clone()),
+                        BackendType::OarOcr => (self.oar_ocr_state.clone(), ctx.clone()),
+                        _ => (self.ocr_rs_state.clone(), ctx.clone()),
+                    };
+                    *state_arc.lock().unwrap() = InstallState::Checking;
+                    let b_type = current_backend;
+                    std::thread::spawn(move || {
+                        let available = match b_type {
+                            BackendType::Tesseract => detect_tesseract(),
+                            BackendType::PaddleOcr => detect_paddle(),
+                            BackendType::RapidOcr => detect_rapid(),
+                            BackendType::OcrRs => detect_ocr_rs(),
+                            BackendType::OarOcr => detect_oar_ocr(),
+                            _ => false,
+                        };
+                        *state_arc.lock().unwrap() = if available {
+                            InstallState::Available
+                         } else {
+                            InstallState::NotInstalled
+                         };
+                         ctx_clone.request_repaint();
+                    });
+                }
+            }
+            
+            // 引擎状态指示灯与文字
+            let engine_state = match current_backend {
+                BackendType::Tesseract => Some(self.tess_state.lock().unwrap().clone()),
+                BackendType::PaddleOcr => Some(self.paddle_state.lock().unwrap().clone()),
+                BackendType::RapidOcr  => Some(self.rapid_state.lock().unwrap().clone()),
+                BackendType::OcrRs     => Some(self.ocr_rs_state.lock().unwrap().clone()),
+                BackendType::OarOcr    => Some(self.oar_ocr_state.lock().unwrap().clone()),
+                _ => None,
+            };
+            
+            if let Some(state) = engine_state {
+                match &state {
+                    InstallState::Unchecked => {
+                        ui.horizontal_centered(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                            ui.painter().rect_filled(rect, 2.0, egui::Color32::GRAY);
+                            ui.label(egui::RichText::new("未检测").size(12.0).color(egui::Color32::GRAY));
+                        });
+                    }
+                    InstallState::Checking => {
+                        ui.horizontal_centered(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                            ui.painter().rect_filled(rect, 2.0, egui::Color32::from_rgb(250, 204, 21));
+                            ui.label(egui::RichText::new("检测中").size(12.0).color(egui::Color32::from_rgb(250, 204, 21)));
+                        });
+                    }
+                    InstallState::Available => {
+                        ui.horizontal_centered(|ui| {
+                            ui.spacing_mut().item_spacing.x = 5.0;
+                            let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                            ui.painter().rect_filled(rect, 2.0, egui::Color32::from_rgb(34, 197, 94));
+                            ui.label(egui::RichText::new("已安装").size(12.0).color(egui::Color32::from_rgb(74, 222, 128)));
+                        });
+                    }
+                    InstallState::NotInstalled => {
+                        ui.horizontal_centered(|ui| {
+                            if ui.small_button("安装").clicked() {
+                                match current_backend {
+                                    BackendType::Tesseract => start_tesseract_install(self.tess_state.clone(), ctx.clone()),
+                                    BackendType::PaddleOcr => start_paddle_install(self.paddle_state.clone(), ctx.clone()),
+                                    BackendType::RapidOcr => start_rapid_install(self.rapid_state.clone(), ctx.clone()),
+                                    BackendType::OcrRs => start_ocr_rs_install(self.ocr_rs_state.clone(), ctx.clone()),
+                                    BackendType::OarOcr => start_oar_ocr_install(self.oar_ocr_state.clone(), ctx.clone()),
+                                    _ => {}
+                                }
+                            }
+                        });
+                    }
+                    InstallState::Installing(msg) => {
+                        ui.horizontal_centered(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                            ui.painter().rect_filled(rect, 2.0, egui::Color32::from_rgb(250, 204, 21));
+                            
+                            let display_msg = if msg.contains("正在下载") {
+                                if msg.contains("Tesseract") {
+                                    "下载中 (Tesseract)...".to_string()
+                                } else if msg.contains("中文语言包") {
+                                    "下载中 (语言包)...".to_string()
+                                } else if msg.contains("PaddleOCR") {
+                                    "下载中 (PaddleOCR)...".to_string()
+                                } else if msg.contains("RapidOCR") {
+                                    "下载中 (RapidOCR)...".to_string()
+                                } else if msg.contains("检测模型") {
+                                    "下载中 (检测模型)...".to_string()
+                                } else if msg.contains("识别模型") {
+                                    "下载中 (识别模型)...".to_string()
+                                } else if msg.contains("字符集") {
+                                    "下载中 (字符集)...".to_string()
+                                } else {
+                                    "下载中...".to_string()
+                                }
+                            } else if msg.contains("正在解压") {
+                                "解压中...".to_string()
+                            } else if msg.contains("等待 UAC") {
+                                "等待授权...".to_string()
+                            } else {
+                                msg.clone()
+                            };
+                            
+                            ui.label(egui::RichText::new(format!("⏳ {}", display_msg)).size(12.0).color(egui::Color32::from_rgb(250, 204, 21)))
+                                .on_hover_text(msg.as_str());
+                        });
+                    }
+                    InstallState::Failed(err) => {
+                        ui.horizontal_centered(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                            ui.painter().rect_filled(rect, 2.0, egui::Color32::from_rgb(248, 113, 113));
+                            let short = if err.chars().count() > 10 {
+                                format!("{}…", &err.chars().take(10).collect::<String>())
+                            } else {
+                                err.clone()
+                            };
+                            ui.label(egui::RichText::new(format!("安装失败 ({})", short)).size(12.0).color(egui::Color32::from_rgb(248, 113, 113)))
+                                .on_hover_text(err.as_str());
+                            if ui.small_button("重试").clicked() {
+                                match current_backend {
+                                    BackendType::Tesseract => start_tesseract_install(self.tess_state.clone(), ctx.clone()),
+                                    BackendType::PaddleOcr => start_paddle_install(self.paddle_state.clone(), ctx.clone()),
+                                    BackendType::RapidOcr => start_rapid_install(self.rapid_state.clone(), ctx.clone()),
+                                    BackendType::OcrRs => start_ocr_rs_install(self.ocr_rs_state.clone(), ctx.clone()),
+                                    BackendType::OarOcr => start_oar_ocr_install(self.oar_ocr_state.clone(), ctx.clone()),
+                                    _ => {}
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+
+            // 云端配置按钮
+            ui.add_space(4.0);
+            let cloud_btn = ui.button("⚙ 云配置");
+            if cloud_btn.clicked() {
+                self.show_settings = true;
+            }
+            cloud_btn.on_hover_text("配置云端 OCR 引擎的 API 密钥及参数");
+        });
+
+        ui.add_space(6.0);
+        let stroke_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 15);
+        let cursor_y = ui.cursor().min.y;
+        let width = ui.available_width();
+        ui.painter().hline(
+            ui.cursor().min.x..=(ui.cursor().min.x + width),
+            cursor_y,
+            egui::Stroke::new(1.0, stroke_color),
+        );
+        ui.add_space(8.0);
+
+        // ── 操作栏 (选区、暂停、复制、云配置、耗时) ──
+        ui.horizontal(|ui| {
+            let sel_btn = ui.button("⛶ 选区");
+            if sel_btn.clicked() {
+                if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
+                    if rect.min.x > -9000.0 && rect.min.y > -9000.0 {
+                        self.float_pos = rect.min;
+                    }
+                }
+                *self.ocr_region.lock().unwrap() = None;
+                *self.paused.lock().unwrap() = true;
+                self.select_step = 1;
+            }
+            sel_btn.on_hover_text("选择屏幕区域开始持续 OCR 识别");
+
+            let has_region = self.ocr_region.lock().unwrap().is_some();
+            if has_region {
+                let is_paused = *self.paused.lock().unwrap();
+                let play_pause_btn = if is_paused { "▶ 继续" } else { "▶I 暂停" };
+                let btn_res = ui.button(play_pause_btn);
+                if btn_res.clicked() {
+                    let mut p = self.paused.lock().unwrap();
+                    *p = !*p;
+                }
+                btn_res.on_hover_text(if is_paused { "继续识别" } else { "暂停识别" });
+            }
+
+            let text = self.text.lock().unwrap().clone();
+            let copy_btn = ui.button("📋 复制");
+            if copy_btn.clicked() {
+                ui.output_mut(|o| o.copied_text = text);
+            }
+            copy_btn.on_hover_text("复制识别结果到剪贴板");
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let ms = *self.elapsed.lock().unwrap();
+                let interval = *self.interval.lock().unwrap();
+                if ms > 0 {
+                    ui.label(
+                        egui::RichText::new(format!("🕒 {}ms / {}ms", ms, interval))
+                            .color(egui::Color32::from_rgb(156, 163, 175))
+                            .size(11.0),
+                    );
+                }
+            });
+        });
+
+        ui.add_space(6.0);
+        let cursor_y = ui.cursor().min.y;
+        ui.painter().hline(
+            ui.cursor().min.x..=(ui.cursor().min.x + width),
+            cursor_y,
+            egui::Stroke::new(1.0, stroke_color),
+        );
+        ui.add_space(8.0);
+
+        // ── 内容展示区 ──
+        let mut text_lock = self.text.lock().unwrap();
+        let has_text = !text_lock.is_empty() && *text_lock != "等待选择区域...";
+
+        if !has_text {
+            ui.vertical_centered(|ui| {
+                ui.add_space(15.0);
+                ui.label(egui::RichText::new("🔍").size(32.0));
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("暂无识别内容")
+                        .strong()
+                        .color(egui::Color32::from_rgb(209, 213, 219))
+                        .size(13.0)
+                );
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new("点击左上角「🎯选区」开始框选识别")
+                        .color(egui::Color32::from_rgb(156, 163, 175))
+                        .size(11.0)
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new("提示: 选区时按 Esc 可退出")
+                        .color(egui::Color32::from_rgb(107, 114, 128))
+                        .size(10.0)
+                );
+                ui.add_space(15.0);
+            });
+        } else {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let available = ui.available_size();
+                    ui.add_sized(
+                        available,
+                        egui::TextEdit::multiline(&mut *text_lock)
+                            .font(egui::FontId::proportional(13.0))
+                            .text_color(egui::Color32::from_rgb(229, 231, 235))
+                            .frame(false),
+                    );
+                });
+        }
+    }
 }
 
 #[derive(PartialEq)]
@@ -1880,6 +2303,7 @@ struct FloatApp {
     mode: AppMode,
     select_step: u8,
     frame_delay: u8,
+    show_settings: bool,
 
     // OCR 共享状态
     ocr_region: Arc<Mutex<Option<(i32, i32, u32, u32)>>>,
@@ -2173,386 +2597,10 @@ impl eframe::App for FloatApp {
                 .frame(card_frame)
                 .show(ctx, |ui| {
                     ui.vertical(|ui| {
-                        // ── 引擎选择及状态行 (移至顶部) ──
-                        ui.horizontal(|ui| {
-                            ui.set_min_height(ui.spacing().interact_size.y);
-                            ui.horizontal_centered(|ui| {
-                                ui.label(egui::RichText::new("引擎:").size(12.0).color(egui::Color32::from_rgb(240, 240, 245)));
-                                ui.label(egui::RichText::new("ℹ").size(12.0).color(egui::Color32::GRAY))
-                                    .on_hover_text("【本地引擎运行模式说明】\n\n• 内置 MNN/ONNX 引擎 (PP-OCRv5 / OarOCR)：\n  - 直接在程序内部加载推理，冷启动和识别可在毫秒级完成，最节省系统资源。\n  - 若底层算法库遭遇致命崩溃，会连带导致主程序闪退。\n\n• 外置子进程引擎 (PaddleOCR-json / RapidOCR-json)：\n  - 独立运行于后台进程中，通过 stdio 管道通信，需首次下载额外引擎包。\n  - 具备崩溃隔离保护，子进程异常崩溃不会影响主程序，但有轻微的跨进程开销。");
-                            });
-                            let mut current_backend = *self.selected_backend.lock().unwrap();
-                            let prev_backend = current_backend;
-                            
-                            egui::ComboBox::from_id_source("backend_select")
-                                .selected_text(current_backend.display_name())
-                                .width(120.0)
-                                .show_ui(ui, |ui| {
-                                    ui.label(egui::RichText::new("── 本地 ──").size(10.0).color(egui::Color32::GRAY));
-                                    #[cfg(target_os = "windows")]
-                                    ui.selectable_value(&mut current_backend, BackendType::WindowsNative, "Windows 原生 (系统自带)")
-                                        .on_hover_text("Windows 原生 OCR：\n• 调用 Windows 系统内置 OCR 引擎\n• 零额外开销，启动极快，支持中英文\n• 推荐在无需高精度排版识别的日常场景下使用");
-                                    #[cfg(target_os = "macos")]
-                                    ui.selectable_value(&mut current_backend, BackendType::MacNative, "macOS 原生 (系统自带)")
-                                        .on_hover_text("macOS 原生 OCR：\n• 调用 macOS 系统 Vision 框架 API\n• 速度极快，识别率高，无需联网及额外下载");
-                                    ui.selectable_value(&mut current_backend, BackendType::Tesseract,    "Tesseract (传统多语言)")
-                                        .on_hover_text("Tesseract OCR：\n• 经典开源 OCR 引擎\n• 支持极其丰富的多国语言包，适合小语种识别");
-                                    ui.selectable_value(&mut current_backend, BackendType::OcrRs,        "PP-OCRv5 (MNN 内置, 极速)")
-                                        .on_hover_text("PP-OCRv5 (内置 MNN 引擎)：\n• 采用最新 PP-OCRv5 算法，性能和体积平衡极佳\n• 在程序内部加载运行，零跨进程通信延迟，推荐作为离线 OCR 首选");
-                                    ui.selectable_value(&mut current_backend, BackendType::OarOcr,       "OarOCR (ONNX 内置, 兼容好)")
-                                        .on_hover_text("OarOCR (内置 ONNX 引擎)：\n• 使用主程序内置的 ONNX Runtime 进行推理，兼容性与稳定性强\n• 直接在当前进程内加载，冷启动与识别迅速，最省系统资源");
-                                    #[cfg(target_os = "windows")]
-                                    ui.selectable_value(&mut current_backend, BackendType::PaddleOcr,    "PaddleOCR-json (Paddle 外置, 高精)")
-                                        .on_hover_text("PaddleOCR-json (外置 Paddle 引擎)：\n• 基于官方 C++ 预测库，独立进程运行，首次切换需下载约 98MB 引擎包\n• 识别精度非常优秀，对段落合并与复杂文本排版支持极佳");
-                                    #[cfg(target_os = "windows")]
-                                    ui.selectable_value(&mut current_backend, BackendType::RapidOcr,     "RapidOCR-json (ONNX 外置, 稳定)")
-                                        .on_hover_text("RapidOCR-json (外置 ONNX 引擎)：\n• 独立子进程运行的 ONNX 推理引擎（RapidOCR-json.exe）\n• 具备“崩溃隔离”优势，子进程异常崩溃绝不影响主程序，稳定性高");
-                                    ui.separator();
-                                    ui.label(egui::RichText::new("── 云端 ──").size(10.0).color(egui::Color32::GRAY));
-                                    ui.selectable_value(&mut current_backend, BackendType::BaiduAiStudio, "百度 AI Studio (高精云端)")
-                                        .on_hover_text("百度 AI Studio (云端 API)：\n• 联网请求百度智能云 OCR 服务\n• 识别精确度最高，对倾斜、手写、复杂表格等效果极佳，需联网和配置 Key");
-                                });
-                                
-                            if current_backend != prev_backend {
-                                *self.selected_backend.lock().unwrap() = current_backend;
-                                self.save_current_settings();
-                                // 切换引擎时触发检测（若尚未检测）
-                                let need_check = match current_backend {
-                                    BackendType::Tesseract => {
-                                        *self.tess_state.lock().unwrap() == InstallState::Unchecked
-                                    }
-                                    BackendType::PaddleOcr => {
-                                        *self.paddle_state.lock().unwrap() == InstallState::Unchecked
-                                    }
-                                    BackendType::RapidOcr => {
-                                        *self.rapid_state.lock().unwrap() == InstallState::Unchecked
-                                    }
-                                    BackendType::OcrRs => {
-                                        *self.ocr_rs_state.lock().unwrap() == InstallState::Unchecked
-                                    }
-                                    BackendType::OarOcr => {
-                                        *self.oar_ocr_state.lock().unwrap() == InstallState::Unchecked
-                                    }
-                                    _ => false,
-                                };
-                                if need_check {
-                                    let (state_arc, ctx_clone) = match current_backend {
-                                        BackendType::Tesseract => (self.tess_state.clone(), ui.ctx().clone()),
-                                        BackendType::PaddleOcr => (self.paddle_state.clone(), ui.ctx().clone()),
-                                        BackendType::RapidOcr => (self.rapid_state.clone(), ui.ctx().clone()),
-                                        BackendType::OcrRs => (self.ocr_rs_state.clone(), ui.ctx().clone()),
-                                        BackendType::OarOcr => (self.oar_ocr_state.clone(), ui.ctx().clone()),
-                                        _ => (self.ocr_rs_state.clone(), ui.ctx().clone()),
-                                    };
-                                    *state_arc.lock().unwrap() = InstallState::Checking;
-                                    let b_type = current_backend;
-                                    std::thread::spawn(move || {
-                                        let available = match b_type {
-                                            BackendType::Tesseract => detect_tesseract(),
-                                            BackendType::PaddleOcr => detect_paddle(),
-                                            BackendType::RapidOcr => detect_rapid(),
-                                            BackendType::OcrRs => detect_ocr_rs(),
-                                            BackendType::OarOcr => detect_oar_ocr(),
-                                            _ => false,
-                                        };
-                                        *state_arc.lock().unwrap() = if available {
-                                            InstallState::Available
-                                         } else {
-                                            InstallState::NotInstalled
-                                         };
-                                         ctx_clone.request_repaint();
-                                    });
-                                }
-                            }
-
-                            // 引擎状态指示灯与文字
-                            let engine_state = match current_backend {
-                                BackendType::Tesseract => Some(self.tess_state.lock().unwrap().clone()),
-                                BackendType::PaddleOcr => Some(self.paddle_state.lock().unwrap().clone()),
-                                BackendType::RapidOcr  => Some(self.rapid_state.lock().unwrap().clone()),
-                                BackendType::OcrRs     => Some(self.ocr_rs_state.lock().unwrap().clone()),
-                                BackendType::OarOcr    => Some(self.oar_ocr_state.lock().unwrap().clone()),
-                                _ => None,
-                            };
-                            
-                            if let Some(state) = engine_state {
-                                match &state {
-                                    InstallState::Unchecked => {
-                                        ui.horizontal_centered(|ui| {
-                                            ui.spacing_mut().item_spacing.x = 4.0;
-                                            let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-                                            ui.painter().rect_filled(rect, 2.0, egui::Color32::GRAY);
-                                            ui.label(egui::RichText::new("未检测").size(12.0).color(egui::Color32::GRAY));
-                                        });
-                                    }
-                                    InstallState::Checking => {
-                                        ui.horizontal_centered(|ui| {
-                                            ui.spacing_mut().item_spacing.x = 4.0;
-                                            let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-                                            ui.painter().rect_filled(rect, 2.0, egui::Color32::from_rgb(250, 204, 21));
-                                            ui.label(egui::RichText::new("检测中").size(12.0).color(egui::Color32::from_rgb(250, 204, 21)));
-                                        });
-                                    }
-                                    InstallState::Available => {
-                                        ui.horizontal_centered(|ui| {
-                                            ui.spacing_mut().item_spacing.x = 5.0;
-                                            let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-                                            ui.painter().rect_filled(rect, 2.0, egui::Color32::from_rgb(34, 197, 94)); // 亮绿
-                                            ui.label(egui::RichText::new("已安装").size(12.0).color(egui::Color32::from_rgb(74, 222, 128)));
-                                        });
-                                    }
-                                    InstallState::NotInstalled => {
-                                        ui.horizontal_centered(|ui| {
-                                            if ui.small_button("安装").clicked() {
-                                                match current_backend {
-                                                    BackendType::Tesseract => start_tesseract_install(self.tess_state.clone(), ui.ctx().clone()),
-                                                    BackendType::PaddleOcr => start_paddle_install(self.paddle_state.clone(), ui.ctx().clone()),
-                                                    BackendType::RapidOcr => start_rapid_install(self.rapid_state.clone(), ui.ctx().clone()),
-                                                    BackendType::OcrRs => start_ocr_rs_install(self.ocr_rs_state.clone(), ui.ctx().clone()),
-                                                    BackendType::OarOcr => start_oar_ocr_install(self.oar_ocr_state.clone(), ui.ctx().clone()),
-                                                    _ => {}
-                                                }
-                                            }
-                                        });
-                                    }
-                                    InstallState::Installing(msg) => {
-                                        ui.horizontal_centered(|ui| {
-                                            ui.spacing_mut().item_spacing.x = 4.0;
-                                            let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-                                            ui.painter().rect_filled(rect, 2.0, egui::Color32::from_rgb(250, 204, 21));
-                                            
-                                            let display_msg = if msg.contains("正在下载") {
-                                                if msg.contains("Tesseract") {
-                                                    "下载中 (Tesseract)...".to_string()
-                                                } else if msg.contains("中文语言包") {
-                                                    "下载中 (语言包)...".to_string()
-                                                } else if msg.contains("PaddleOCR") {
-                                                    "下载中 (PaddleOCR)...".to_string()
-                                                } else if msg.contains("RapidOCR") {
-                                                    "下载中 (RapidOCR)...".to_string()
-                                                } else if msg.contains("检测模型") {
-                                                    "下载中 (检测模型)...".to_string()
-                                                } else if msg.contains("识别模型") {
-                                                    "下载中 (识别模型)...".to_string()
-                                                } else if msg.contains("字符集") {
-                                                    "下载中 (字符集)...".to_string()
-                                                } else {
-                                                    "下载中...".to_string()
-                                                }
-                                            } else if msg.contains("正在解压") {
-                                                "解压中...".to_string()
-                                            } else if msg.contains("等待 UAC") {
-                                                "等待授权...".to_string()
-                                            } else {
-                                                msg.clone()
-                                            };
-                                            
-                                            ui.label(egui::RichText::new(format!("⏳ {}", display_msg)).size(12.0).color(egui::Color32::from_rgb(250, 204, 21)))
-                                                .on_hover_text(msg.as_str());
-                                        });
-                                    }
-                                    InstallState::Failed(err) => {
-                                        ui.horizontal_centered(|ui| {
-                                            ui.spacing_mut().item_spacing.x = 4.0;
-                                            let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-                                            ui.painter().rect_filled(rect, 2.0, egui::Color32::from_rgb(248, 113, 113));
-                                            let short = if err.chars().count() > 10 {
-                                                format!("{}…", &err.chars().take(10).collect::<String>())
-                                            } else {
-                                                err.clone()
-                                            };
-                                            ui.label(egui::RichText::new(format!("安装失败 ({})", short)).size(12.0).color(egui::Color32::from_rgb(248, 113, 113)))
-                                                .on_hover_text(err.as_str());
-                                            if ui.small_button("重试").clicked() {
-                                                match current_backend {
-                                                    BackendType::Tesseract => start_tesseract_install(self.tess_state.clone(), ui.ctx().clone()),
-                                                    BackendType::PaddleOcr => start_paddle_install(self.paddle_state.clone(), ui.ctx().clone()),
-                                                    BackendType::RapidOcr => start_rapid_install(self.rapid_state.clone(), ui.ctx().clone()),
-                                                    BackendType::OcrRs => start_ocr_rs_install(self.ocr_rs_state.clone(), ui.ctx().clone()),
-                                                    BackendType::OarOcr => start_oar_ocr_install(self.oar_ocr_state.clone(), ui.ctx().clone()),
-                                                    _ => {}
-                                                }
-                                            }
-                                        });
-                                    }
-                                }
-                            }
-                        });
-
-                        // ── 百度 AI Studio 配置行 ──
-                        if *self.selected_backend.lock().unwrap() == BackendType::BaiduAiStudio {
-                            ui.add_space(2.0);
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new("🔑 Token:").size(12.0).color(egui::Color32::from_rgb(156, 163, 175)));
-                                let mut token = self.baidu_token.lock().unwrap().clone();
-                                // Mask with password(true) for privacy
-                                let token_edit = egui::TextEdit::singleline(&mut token)
-                                    .password(true)
-                                    .desired_width(100.0);
-                                if ui.add(token_edit).changed() {
-                                    *self.baidu_token.lock().unwrap() = token;
-                                    self.save_current_settings();
-                                }
-
-                                ui.add_space(6.0);
-
-                                ui.label(egui::RichText::new("🤖 模型:").size(12.0).color(egui::Color32::from_rgb(156, 163, 175)));
-                                let mut model = self.baidu_model.lock().unwrap().clone();
-                                let prev_model = model.clone();
-                                egui::ComboBox::from_id_source("baidu_model_select")
-                                    .selected_text(model.as_str())
-                                    .width(110.0)
-                                    .show_ui(ui, |ui| {
-                                        ui.selectable_value(&mut model, String::from("PaddleOCR-VL-1.6"), "PaddleOCR-VL-1.6");
-                                    });
-                                if model != prev_model {
-                                    *self.baidu_model.lock().unwrap() = model;
-                                    self.save_current_settings();
-                                }
-                            });
-
-                            if *self.baidu_model.lock().unwrap() == "PaddleOCR-VL-1.6" {
-                                ui.add_space(2.0);
-                                ui.horizontal(|ui| {
-                                    let mut use_ori = *self.baidu_use_orientation.lock().unwrap();
-                                    let mut use_unw = *self.baidu_use_unwarping.lock().unwrap();
-                                    let mut use_crt = *self.baidu_use_chart.lock().unwrap();
-
-                                    let mut changed = false;
-                                    if ui.checkbox(&mut use_ori, "方向").changed() {
-                                        *self.baidu_use_orientation.lock().unwrap() = use_ori;
-                                        changed = true;
-                                    }
-                                    if ui.checkbox(&mut use_unw, "去畸变").changed() {
-                                        *self.baidu_use_unwarping.lock().unwrap() = use_unw;
-                                        changed = true;
-                                    }
-                                    if ui.checkbox(&mut use_crt, "图表").changed() {
-                                        *self.baidu_use_chart.lock().unwrap() = use_crt;
-                                        changed = true;
-                                    }
-                                    if changed {
-                                        self.save_current_settings();
-                                    }
-                                });
-                            }
-                        }
-
-                        ui.add_space(6.0);
-                        // 极细的半透明白色分割线
-                        let stroke_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 15);
-                        let cursor_y = ui.cursor().min.y;
-                        let width = ui.available_width();
-                        ui.painter().hline(
-                            ui.cursor().min.x..=(ui.cursor().min.x + width),
-                            cursor_y,
-                            egui::Stroke::new(1.0, stroke_color),
-                        );
-                        ui.add_space(8.0);
-
-                        // ── 操作栏 (选区、暂停、复制、耗时，在下面) ──
-                        ui.horizontal(|ui| {
-                            // 选区按钮 (虚线选框图标)
-                            let sel_btn = ui.button("⛶ 选区");
-                            if sel_btn.clicked() {
-                                if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
-                                    if rect.min.x > -9000.0 && rect.min.y > -9000.0 {
-                                        self.float_pos = rect.min;
-                                    }
-                                }
-                                *self.ocr_region.lock().unwrap() = None;
-                                *self.paused.lock().unwrap() = true;
-                                self.select_step = 1;
-                            }
-                            sel_btn.on_hover_text("选择屏幕区域开始持续 OCR 识别");
-
-                            // 继续/暂停按钮
-                            let has_region = self.ocr_region.lock().unwrap().is_some();
-                            if has_region {
-                                let is_paused = *self.paused.lock().unwrap();
-                                let play_pause_btn = if is_paused { "▶ 继续" } else { "▶I 暂停" };
-                                let btn_res = ui.button(play_pause_btn);
-                                if btn_res.clicked() {
-                                    let mut p = self.paused.lock().unwrap();
-                                    *p = !*p;
-                                }
-                                btn_res.on_hover_text(if is_paused { "继续识别" } else { "暂停识别" });
-                            }
-
-                            // 复制按钮
-                            let text = self.text.lock().unwrap().clone();
-                            let copy_btn = ui.button("📋 复制");
-                            if copy_btn.clicked() {
-                                ui.output_mut(|o| o.copied_text = text);
-                            }
-                            copy_btn.on_hover_text("复制识别结果到剪贴板");
-
-                            // 耗时与间隔时钟显示 (右对齐)
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let ms = *self.elapsed.lock().unwrap();
-                                let interval = *self.interval.lock().unwrap();
-                                if ms > 0 {
-                                    ui.label(
-                                        egui::RichText::new(format!("🕒 {}ms / {}ms", ms, interval))
-                                            .color(egui::Color32::from_rgb(156, 163, 175))
-                                            .size(11.0),
-                                    );
-                                }
-                            });
-                        });
-
-                        ui.add_space(6.0);
-                        // 第二个分割线，隔开操作栏与文本内容
-                        let cursor_y = ui.cursor().min.y;
-                        ui.painter().hline(
-                            ui.cursor().min.x..=(ui.cursor().min.x + width),
-                            cursor_y,
-                            egui::Stroke::new(1.0, stroke_color),
-                        );
-                        ui.add_space(8.0);
-
-                        // ── 内容展示区 ──
-                        let mut text_lock = self.text.lock().unwrap();
-                        let has_text = !text_lock.is_empty() && *text_lock != "等待选择区域...";
-
-                        if !has_text {
-                            // ── 现代化空状态展示 (Empty State) ──
-                            ui.vertical_centered(|ui| {
-                                ui.add_space(15.0);
-                                ui.label(egui::RichText::new("🔍").size(32.0));
-                                ui.add_space(6.0);
-                                ui.label(
-                                    egui::RichText::new("暂无识别内容")
-                                        .strong()
-                                        .color(egui::Color32::from_rgb(209, 213, 219))
-                                        .size(13.0)
-                                );
-                                ui.add_space(2.0);
-                                ui.label(
-                                    egui::RichText::new("点击左上角「🎯选区」开始框选识别")
-                                        .color(egui::Color32::from_rgb(156, 163, 175))
-                                        .size(11.0)
-                                );
-                                ui.add_space(4.0);
-                                ui.label(
-                                    egui::RichText::new("提示: 选区时按 Esc 可退出")
-                                        .color(egui::Color32::from_rgb(107, 114, 128))
-                                        .size(10.0)
-                                );
-                                ui.add_space(15.0);
-                            });
+                        if self.show_settings {
+                            self.draw_settings_page(ui);
                         } else {
-                            // ── 识别结果可编辑框 ──
-                            egui::ScrollArea::vertical()
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| {
-                                    let available = ui.available_size();
-                                    ui.add_sized(
-                                        available,
-                                        egui::TextEdit::multiline(&mut *text_lock)
-                                            .font(egui::FontId::proportional(13.0))
-                                    );
-                                });
+                            self.draw_main_page(ui, ctx);
                         }
                     });
                 });
@@ -2713,11 +2761,11 @@ fn main() -> Result<()> {
     // 2. 设定始终置顶的悬浮窗口参数（使用系统标题栏和边框）
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([350.0, 300.0])
+            .with_inner_size([480.0, 300.0])
             .with_position([100.0, 100.0])
             .with_always_on_top()
             .with_resizable(true)  // 允许拖动调整窗口大小
-            .with_min_inner_size([280.0, 200.0]),  // 设置最小尺寸
+            .with_min_inner_size([450.0, 200.0]),  // 设置最小尺寸
         ..Default::default()
     };
 
@@ -3007,6 +3055,7 @@ fn main() -> Result<()> {
                 mode: AppMode::Float,
                 select_step: 0,
                 frame_delay: 0,
+                show_settings: false,
                 ocr_region: shared_region,
                 paused: shared_paused,
                 text: shared_text,
@@ -3023,7 +3072,7 @@ fn main() -> Result<()> {
                 rapid_state:  shared_rapid_state,
                 ocr_rs_state: shared_ocr_rs_state,
                 oar_ocr_state: shared_oar_ocr_state,
-                float_size: egui::vec2(350.0, 300.0),
+                float_size: egui::vec2(480.0, 300.0),
                 screenshot_texture: None,
                 screenshot_raw: Vec::new(),
                 screenshot_width: 0,
