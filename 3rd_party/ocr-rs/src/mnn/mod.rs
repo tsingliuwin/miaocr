@@ -294,10 +294,30 @@ mod normal_impl {
             model_path: impl AsRef<std::path::Path>,
             config: Option<InferenceConfig>,
         ) -> Result<Self> {
-            let model_buffer = std::fs::read(model_path.as_ref()).map_err(|e| {
-                MnnError::ModelLoadFailed(format!("Failed to read model file: {}", e))
-            })?;
-            Self::from_buffer(&model_buffer, config)
+            let path_str = model_path
+                .as_ref()
+                .to_str()
+                .ok_or_else(|| MnnError::InvalidParameter("Invalid path encoding".to_string()))?;
+            let c_path = std::ffi::CString::new(path_str)
+                .map_err(|e| MnnError::InvalidParameter(format!("Failed to convert path to CString: {}", e)))?;
+
+            let cfg = config.unwrap_or_default();
+            let c_config = cfg.to_ffi();
+
+            let engine_ptr = unsafe {
+                ffi::mnnr_create_engine_from_file(c_path.as_ptr(), &c_config)
+            };
+
+            let ptr = NonNull::new(engine_ptr)
+                .ok_or_else(|| MnnError::ModelLoadFailed(get_last_error_message(None)))?;
+
+            let (input_shape, output_shape) = unsafe { Self::get_shapes(ptr.as_ptr())? };
+
+            Ok(InferenceEngine {
+                ptr,
+                input_shape,
+                output_shape,
+            })
         }
 
         /// Create inference engine from model byte data using shared runtime

@@ -169,12 +169,20 @@ impl JsonOcrEngine {
     fn new(exe_path: &Path) -> Result<Self> {
         let exe_dir = exe_path.parent().ok_or_else(|| anyhow::anyhow!("Invalid executable path"))?;
         
-        let mut child = Command::new(exe_path)
-            .current_dir(exe_dir)
+        let mut cmd = Command::new(exe_path);
+        cmd.current_dir(exe_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
+            .stderr(Stdio::null());
+
+        // Windows GUI 程序：禁止子进程弹出控制台窗口 (CREATE_NO_WINDOW = 0x08000000)
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000);
+        }
+
+        let mut child = cmd.spawn()?;
             
         let stdin_writer = child.stdin.take().ok_or_else(|| anyhow::anyhow!("Failed to open stdin"))?;
         let stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("Failed to open stdout"))?;
@@ -479,6 +487,7 @@ fn ocr_ocr_rs(bgra: &[u8], width: u32, height: u32) -> Result<String> {
     let res = OCR_RS_ENGINE.with(|cell| {
         let mut lock = cell.borrow_mut();
         if lock.is_none() {
+            runtime_log("[OCR-RS] 初始化引擎: 检测模型文件...");
             if !detect_ocr_rs() {
                 err_opt = Some(anyhow::anyhow!("本地 PP-OCRv5 引擎模型未安装。请在界面中点击「安装」。"));
                 return None;
@@ -488,11 +497,23 @@ fn ocr_ocr_rs(bgra: &[u8], width: u32, height: u32) -> Result<String> {
             let rec_path = models_dir.join("PP-OCRv5_mobile_rec.mnn");
             let keys_path = models_dir.join("ppocr_keys_v5.txt");
             
-            match ocr_rs::OcrEngine::new(&det_path, &rec_path, &keys_path, None) {
+            runtime_log(&format!("[OCR-RS] 加载模型: det={}, rec={}, keys={}",
+                det_path.display(), rec_path.display(), keys_path.display()));
+            
+            // 禁用并行识别 + 单线程推理：
+            // 1. rayon 并行会导致多线程同时调用 MNN FFI 产生数据竞争
+            // 2. MNN 默认 4 线程，在后台 OCR 线程中可能与其他组件竞争资源
+            let config = ocr_rs::OcrEngineConfig::new()
+                .with_parallel(false)
+                .with_threads(1);
+            runtime_log("[OCR-RS] OcrEngine::new 开始...");
+            match ocr_rs::OcrEngine::new(&det_path, &rec_path, &keys_path, Some(config)) {
                 Ok(engine) => {
+                    runtime_log("[OCR-RS] 引擎初始化成功");
                     *lock = Some(engine);
                 }
                 Err(e) => {
+                    runtime_log(&format!("[OCR-RS] 引擎初始化失败: {:?}", e));
                     err_opt = Some(anyhow::anyhow!("初始化 PP-OCRv5 引擎失败: {:?}", e));
                     return None;
                 }
@@ -518,18 +539,30 @@ fn ocr_ocr_rs(bgra: &[u8], width: u32, height: u32) -> Result<String> {
         };
         let img = image::DynamicImage::ImageRgba8(img_buffer);
         
-        let ocr_res = engine.recognize(&img);
+        // 使用 catch_unwind 保护 MNN C FFI 调用，防止 C++ 异常/段错误直接终止进程
+        let ocr_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            engine.recognize(&img)
+        }));
         
         match ocr_res {
-            Ok(results) => {
+            Ok(Ok(results)) => {
                 let mut lines = Vec::new();
                 for item in results {
                     lines.push(item.text);
                 }
                 Some(lines.join("\n"))
             }
-            Err(e) => {
+            Ok(Err(e)) => {
+                runtime_log(&format!("[OCR-RS] 识别返回错误: {:?}", e));
                 err_opt = Some(anyhow::anyhow!("PP-OCRv5 识别失败: {:?}", e));
+                None
+            }
+            Err(panic_info) => {
+                let msg = format!("PP-OCRv5 引擎 panic: {:?}", panic_info);
+                runtime_log(&format!("[OCR-RS] {}", msg));
+                // panic 后引擎状态可能已损坏，清除以便下次重新初始化
+                *lock = None;
+                err_opt = Some(anyhow::anyhow!("{}", msg));
                 None
             }
         }

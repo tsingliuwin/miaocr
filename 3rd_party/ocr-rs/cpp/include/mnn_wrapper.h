@@ -67,6 +67,12 @@ extern "C"
         size_t size,
         const MNNR_Config *config);
 
+    // Create an inference engine from model file path
+    // Returns NULL on failure
+    MNN_InferenceEngine *mnnr_create_engine_from_file(
+        const char *model_path,
+        const MNNR_Config *config);
+
     // Create an inference engine using a shared runtime
     // This allows multiple engines to share thread pool and memory pool
     MNN_InferenceEngine *mnnr_create_engine_with_runtime(

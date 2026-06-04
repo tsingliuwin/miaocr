@@ -16,7 +16,6 @@ chrono = "0.4"
 ocr-rs = { path = "3rd_party/ocr-rs", features = ["build-mnn-from-source"] }
 oar-ocr = { path = "3rd_party/oar-ocr" }
 
-
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = [
     "Graphics_Imaging",
@@ -33,3 +32,6 @@ mouse_position = "0.1"
 
 [target.'cfg(target_os = "windows")'.build-dependencies]
 winres = "0.1"
+
+[profile.release]
+debug = true

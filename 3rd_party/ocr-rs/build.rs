@@ -20,6 +20,39 @@ enum MnnLinkMode {
 }
 
 fn main() {
+    #[cfg(target_os = "windows")]
+    {
+        let standard_paths = [
+            r"C:\Program Files\CMake\bin",
+            r"C:\Program Files (x86)\CMake\bin",
+        ];
+        let mut paths_to_add = Vec::new();
+        for p in &standard_paths {
+            let path = std::path::Path::new(p);
+            if path.exists() {
+                paths_to_add.push(path.to_path_buf());
+            }
+        }
+        if !paths_to_add.is_empty() {
+            if let Ok(path) = std::env::var("PATH") {
+                let mut path_has_cmake = false;
+                for part in std::env::split_paths(&path) {
+                    if part.join("cmake.exe").exists() {
+                        path_has_cmake = true;
+                        break;
+                    }
+                }
+                if !path_has_cmake {
+                    let mut new_paths = paths_to_add;
+                    new_paths.extend(std::env::split_paths(&path));
+                    if let Ok(new_path_val) = std::env::join_paths(new_paths) {
+                        std::env::set_var("PATH", new_path_val);
+                    }
+                }
+            }
+        }
+    }
+
     // 在 docs.rs 构建环境中，跳过所有 C++ 编译
     if env::var("DOCS_RS").is_ok() || env::var("CARGO_FEATURE_DOCSRS").is_ok() {
         println!("cargo:warning=Building for docs.rs, skipping C++ compilation");
@@ -542,12 +575,18 @@ fn build_mnn_with_cmake(
         .define("MNN_PORTABLE_BUILD", "ON")
         .define("MNN_SEP_BUILD", "OFF");
 
-    // For Windows, always use Release mode to ensure consistent CRT linking
+    // For Windows, use RelWithDebInfo with reduced optimization (/O1) to avoid
+    // MSVC's aggressive /O2 optimizer generating invalid code in MNN's
+    // Interpreter::createFromFile, which causes STATUS_ACCESS_VIOLATION (0xc0000005).
+    // /O1 (favor size) is safer and still performant for inference workloads.
     if os == "windows" {
         // Force NMake Makefiles generator on Windows to avoid MSVC detection issues
         // This is more reliable in CI/CD environments like Jenkins
         config.generator("NMake Makefiles");
-        config.define("CMAKE_BUILD_TYPE", "Release");
+        config.define("CMAKE_BUILD_TYPE", "RelWithDebInfo");
+        // Override optimization flags: /O1 instead of /O2 to avoid miscompilation
+        config.define("CMAKE_C_FLAGS_RELWITHDEBINFO", "/MD /O1 /Ob1 /DNDEBUG /Zi");
+        config.define("CMAKE_CXX_FLAGS_RELWITHDEBINFO", "/MD /O1 /Ob1 /DNDEBUG /Zi");
         // Check if we're using static CRT
         if env::var("CARGO_CFG_TARGET_FEATURE").map_or(false, |f| f.contains("crt-static")) {
             // MNN has a specific option for static CRT on Windows
@@ -555,10 +594,8 @@ fn build_mnn_with_cmake(
 
             // Also set these for extra safety
             config.define("CMAKE_MSVC_RUNTIME_LIBRARY", "MultiThreaded");
-            config.define("CMAKE_C_FLAGS_RELEASE", "/MT /O2 /Ob2 /DNDEBUG");
-            config.define("CMAKE_CXX_FLAGS_RELEASE", "/MT /O2 /Ob2 /DNDEBUG");
-            config.define("CMAKE_C_FLAGS", "/MT");
-            config.define("CMAKE_CXX_FLAGS", "/MT");
+            config.define("CMAKE_C_FLAGS_RELWITHDEBINFO", "/MT /O1 /Ob1 /DNDEBUG /Zi");
+            config.define("CMAKE_CXX_FLAGS_RELWITHDEBINFO", "/MT /O1 /Ob1 /DNDEBUG /Zi");
         }
     } else {
         // For non-Windows platforms, respect debug flag

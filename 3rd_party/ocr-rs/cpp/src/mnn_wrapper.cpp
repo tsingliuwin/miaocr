@@ -4,12 +4,76 @@
 #include <MNN/MNNDefine.h>
 
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <vector>
 #include <mutex>
 #include <condition_variable>
 #include <queue>
 #include <string>
 #include <memory>
+
+#ifdef _WIN32
+#include <windows.h>  // For SEH (__try/__except) and GetExceptionCode
+// Windows' <winerror.h> defines NO_ERROR as a macro (0L),
+// which conflicts with MNN::NO_ERROR enum value.
+#undef NO_ERROR
+#endif
+
+// Forward declare MNN types needed by SEH helpers
+namespace MNN { class Interpreter; }
+
+// ============== SEH-Protected Helpers (Windows only) ==============
+// MSVC's __try/__except cannot coexist with C++ objects that have destructors
+// in the same function scope, so these must be plain-C-style helpers.
+
+#ifdef _WIN32
+// SEH-protected wrapper for MNN::Interpreter::createFromFile
+// Returns the Interpreter pointer, or nullptr if a hardware exception occurred
+static MNN::Interpreter* seh_createFromFile(const char* path) {
+    MNN::Interpreter* result = nullptr;
+    __try {
+        result = MNN::Interpreter::createFromFile(path);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Caught a hardware exception (e.g. STATUS_ACCESS_VIOLATION 0xc0000005)
+        result = nullptr;
+    }
+    return result;
+}
+
+// SEH-protected wrapper for MNN::Interpreter::createFromBuffer
+static MNN::Interpreter* seh_createFromBuffer(const void* buffer, size_t size) {
+    MNN::Interpreter* result = nullptr;
+    __try {
+        result = MNN::Interpreter::createFromBuffer(buffer, size);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        result = nullptr;
+    }
+    return result;
+}
+#endif
+
+// File-based logging for crash diagnosis (writes to ~/.miaocr/miaocr.log)
+static void mnn_log(const char* msg) {
+    const char* home = nullptr;
+#ifdef _WIN32
+    home = getenv("USERPROFILE");
+#endif
+    if (!home) home = getenv("HOME");
+    if (!home) return;
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s\\.miaocr\\miaocr.log", home);
+
+    FILE* f = fopen(path, "a");
+    if (f) {
+        fprintf(f, "[MNN-CPP] %s\n", msg);
+        fflush(f);
+        fclose(f);
+    }
+}
 
 // C++11 compatible make_unique
 template <typename T, typename... Args>
@@ -89,23 +153,32 @@ static MNN::ScheduleConfig create_schedule_config(const MNNR_Config *config)
         schedule.numThread = 4;
     }
 
-    MNN::BackendConfig backend;
-    if (config)
-    {
-        switch (config->precision_mode)
-        {
-        case 1:
-            backend.precision = MNN::BackendConfig::Precision_Low;
-            break;
-        case 2:
-            backend.precision = MNN::BackendConfig::Precision_High;
-            break;
-        default:
-            backend.precision = MNN::BackendConfig::Precision_Normal;
-            break;
-        }
+    // NOTE: BackendConfig must outlive the ScheduleConfig that references it.
+    // Use static instances indexed by precision mode (protected by g_mnn_inference_mutex).
+    static MNN::BackendConfig backend_normal;
+    static MNN::BackendConfig backend_low;
+    static MNN::BackendConfig backend_high;
+    static bool initialized = false;
+    if (!initialized) {
+        backend_normal.precision = MNN::BackendConfig::Precision_Normal;
+        backend_low.precision    = MNN::BackendConfig::Precision_Low;
+        backend_high.precision   = MNN::BackendConfig::Precision_High;
+        initialized = true;
     }
-    schedule.backendConfig = &backend;
+
+    int precision_mode = config ? config->precision_mode : 0;
+    switch (precision_mode)
+    {
+    case 1:
+        schedule.backendConfig = &backend_low;
+        break;
+    case 2:
+        schedule.backendConfig = &backend_high;
+        break;
+    default:
+        schedule.backendConfig = &backend_normal;
+        break;
+    }
 
     return schedule;
 }
@@ -199,36 +272,120 @@ MNN_InferenceEngine *mnnr_create_engine(
 {
     if (!buffer || size == 0)
     {
+        mnn_log("create_engine: buffer is null or size is 0");
         return nullptr;
     }
 
+    char buf[256];
+    snprintf(buf, sizeof(buf), "create_engine: buffer=%p size=%zu threads=%d precision=%d",
+             buffer, size,
+             config ? config->thread_count : -1,
+             config ? config->precision_mode : -1);
+    mnn_log(buf);
+
     auto engine = new MNN_InferenceEngine();
 
-    // Create interpreter from buffer
+    // Create interpreter from buffer (SEH-protected on Windows)
+    mnn_log("create_engine: calling createFromBuffer...");
+#ifdef _WIN32
+    engine->interpreter.reset(seh_createFromBuffer(buffer, size));
+#else
     engine->interpreter.reset(MNN::Interpreter::createFromBuffer(buffer, size));
+#endif
     if (!engine->interpreter)
     {
+        mnn_log("create_engine: createFromBuffer FAILED");
         engine->last_error = "Failed to create interpreter from buffer";
         delete engine;
         return nullptr;
     }
+    mnn_log("create_engine: createFromBuffer OK");
 
     // Create default session
+    mnn_log("create_engine: calling create_schedule_config...");
     MNN::ScheduleConfig schedule = create_schedule_config(config);
+    mnn_log("create_engine: create_schedule_config OK, calling createSession...");
     engine->default_session = engine->interpreter->createSession(schedule);
     if (!engine->default_session)
     {
+        mnn_log("create_engine: createSession FAILED");
         engine->last_error = "Failed to create default session";
         delete engine;
         return nullptr;
     }
+    mnn_log("create_engine: createSession OK");
 
     // Initialize tensors
+    mnn_log("create_engine: calling init_engine_tensors...");
     if (!init_engine_tensors(engine))
     {
+        mnn_log("create_engine: init_engine_tensors FAILED");
         delete engine;
         return nullptr;
     }
+    mnn_log("create_engine: init_engine_tensors OK, engine ready");
+
+    return engine;
+}
+
+MNN_InferenceEngine *mnnr_create_engine_from_file(
+    const char *model_path,
+    const MNNR_Config *config)
+{
+    if (!model_path)
+    {
+        mnn_log("create_engine_from_file: model_path is null");
+        return nullptr;
+    }
+
+    char buf[512];
+    snprintf(buf, sizeof(buf), "create_engine_from_file: path=%s threads=%d precision=%d",
+             model_path,
+             config ? config->thread_count : -1,
+             config ? config->precision_mode : -1);
+    mnn_log(buf);
+
+    auto engine = new MNN_InferenceEngine();
+
+    // Create interpreter from file (SEH-protected on Windows)
+    mnn_log("create_engine_from_file: calling createFromFile...");
+#ifdef _WIN32
+    engine->interpreter.reset(seh_createFromFile(model_path));
+#else
+    engine->interpreter.reset(MNN::Interpreter::createFromFile(model_path));
+#endif
+    if (!engine->interpreter)
+    {
+        mnn_log("create_engine_from_file: createFromFile FAILED");
+        engine->last_error = "Failed to create interpreter from file";
+        delete engine;
+        return nullptr;
+    }
+    mnn_log("create_engine_from_file: createFromFile OK");
+
+    // Create default session
+    mnn_log("create_engine_from_file: calling create_schedule_config...");
+    MNN::ScheduleConfig schedule = create_schedule_config(config);
+    mnn_log("create_engine_from_file: create_schedule_config OK, calling createSession...");
+    engine->default_session = engine->interpreter->createSession(schedule);
+    if (!engine->default_session)
+    {
+        mnn_log("create_engine_from_file: createSession FAILED");
+        engine->last_error = "Failed to create default session";
+        delete engine;
+        return nullptr;
+    }
+    mnn_log("create_engine_from_file: createSession OK");
+
+    // Initialize tensors
+    mnn_log("create_engine_from_file: calling init_engine_tensors...");
+    if (!init_engine_tensors(engine))
+    {
+        mnn_log("create_engine_from_file: init_engine_tensors FAILED");
+        delete engine;
+        return nullptr;
+    }
+    mnn_log("create_engine_from_file: init_engine_tensors OK, engine ready");
 
     return engine;
 }
@@ -247,8 +404,12 @@ MNN_InferenceEngine *mnnr_create_engine_with_runtime(
     engine->runtime = runtime;
     engine->owns_runtime = false;
 
-    // Create interpreter from buffer
+    // Create interpreter from buffer (SEH-protected on Windows)
+#ifdef _WIN32
+    engine->interpreter.reset(seh_createFromBuffer(buffer, size));
+#else
     engine->interpreter.reset(MNN::Interpreter::createFromBuffer(buffer, size));
+#endif
     if (!engine->interpreter)
     {
         engine->last_error = "Failed to create interpreter from buffer";
