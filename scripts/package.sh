@@ -29,6 +29,14 @@ mkdir -p "$APP_DIR/Contents/Resources"
 cp target/release/miaocr "$APP_DIR/Contents/MacOS/miaocr"
 chmod +x "$APP_DIR/Contents/MacOS/miaocr"
 
+# Copy icon
+if [ -f "assets/icon.icns" ]; then
+    cp assets/icon.icns "$APP_DIR/Contents/Resources/icon.icns"
+    echo "  Icon copied to resources"
+else
+    echo -e "\033[33m  Warning: assets/icon.icns not found, skipping icon integration\033[0m"
+fi
+
 # Create Info.plist
 cat <<EOF > "$APP_DIR/Contents/Info.plist"
 <?xml version="1.0" encoding="UTF-8"?>
@@ -41,6 +49,8 @@ cat <<EOF > "$APP_DIR/Contents/Info.plist"
     <string>喵OCR</string>
     <key>CFBundleExecutable</key>
     <string>miaocr</string>
+    <key>CFBundleIconFile</key>
+    <string>icon.icns</string>
     <key>CFBundleIdentifier</key>
     <string>com.tsingliu.miaocr</string>
     <key>CFBundleInfoDictionaryVersion</key>

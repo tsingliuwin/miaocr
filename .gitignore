@@ -1,3 +1,4 @@
 /target
 /dist
 .log
+/3rd_party/ocr-rs/3rd_party/
