@@ -115,13 +115,21 @@ fn ocr_tesseract(bgra: &[u8], width: u32, height: u32) -> Result<String> {
     let tessdata_prefix = std::env::var("TESSDATA_PREFIX")
         .unwrap_or_else(|_| r"C:\Program Files\Tesseract-OCR\tessdata".to_string());
 
-    let output = std::process::Command::new("tesseract")
-        .arg(temp_path.to_str().unwrap())
+    let mut cmd = std::process::Command::new("tesseract");
+    cmd.arg(temp_path.to_str().unwrap())
         .arg("stdout")
         .arg("-l")
         .arg("chi_sim")
-        .env("TESSDATA_PREFIX", &tessdata_prefix)
-        .output();
+        .env("TESSDATA_PREFIX", &tessdata_prefix);
+
+    // Windows GUI 程序：禁止子进程弹出控制台窗口 (CREATE_NO_WINDOW = 0x08000000)
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+
+    let output = cmd.output();
 
     let _ = std::fs::remove_file(temp_path);
 
@@ -634,13 +642,19 @@ enum InstallState {
 /// exe 找到后调用 ensure_chi_sim() 确保中文训练数据可用。
 fn detect_tesseract() -> bool {
     // 方式 1：PATH 查找
-    let in_path = std::process::Command::new("tesseract")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    // Windows GUI 程序：禁止子进程弹出控制台窗口 (CREATE_NO_WINDOW = 0x08000000)
+    let in_path = {
+        let mut cmd = std::process::Command::new("tesseract");
+        cmd.arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000);
+        }
+        cmd.status().map(|s| s.success()).unwrap_or(false)
+    };
     if in_path {
         ensure_chi_sim();
         return true;
@@ -694,9 +708,15 @@ fn ensure_chi_sim() {
 
     let mut download_success = false;
     for url in chi_urls {
-        let status = std::process::Command::new("curl")
-            .args(["-k", "-L", "-o", user_chi.to_str().unwrap(), url])
-            .status();
+        let mut cmd = std::process::Command::new("curl");
+        cmd.args(["-k", "-L", "-o", user_chi.to_str().unwrap(), url]);
+        // Windows GUI 程序：禁止子进程弹出控制台窗口 (CREATE_NO_WINDOW = 0x08000000)
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000);
+        }
+        let status = cmd.status();
         if status.map(|s| s.success()).unwrap_or(false) {
             download_success = true;
             break;
@@ -750,9 +770,14 @@ fn start_paddle_install(state: Arc<Mutex<InstallState>>, ctx: egui::Context) {
                 set(InstallState::Installing(msg));
                 
                 runtime_log(&format!("[INSTALL] 尝试自源 {} 下载: {}", idx + 1, url));
-                let status = std::process::Command::new("curl")
-                    .args(["-k", "-L", "--connect-timeout", "30", "--retry", "2", "-o", zip_path.to_str().unwrap(), url])
-                    .status();
+                let mut cmd = std::process::Command::new("curl");
+                cmd.args(["-k", "-L", "--connect-timeout", "30", "--retry", "2", "-o", zip_path.to_str().unwrap(), url]);
+                #[cfg(target_os = "windows")]
+                {
+                    use std::os::windows::process::CommandExt;
+                    cmd.creation_flags(0x08000000);
+                }
+                let status = cmd.status();
                 
                 match status {
                     Ok(s) if s.success() => {
@@ -866,9 +891,14 @@ fn download_file_with_mirrors(
     for (idx, url) in urls.iter().enumerate() {
         set_state(format!("正在下载 {} (源 {}/{})...", label, idx + 1, urls.len()));
         runtime_log(&format!("[INSTALL] 尝试下载 {}: {}", label, url));
-        let status = std::process::Command::new("curl")
-            .args(["-f", "-k", "-L", "--connect-timeout", "30", "--retry", "2", "-o", dest_path.to_str().unwrap(), url])
-            .status();
+        let mut cmd = std::process::Command::new("curl");
+        cmd.args(["-f", "-k", "-L", "--connect-timeout", "30", "--retry", "2", "-o", dest_path.to_str().unwrap(), url]);
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000);
+        }
+        let status = cmd.status();
         match status {
             Ok(s) if s.success() => {
                 runtime_log(&format!("[INSTALL] {} 下载成功", label));
@@ -1060,9 +1090,14 @@ fn start_rapid_install(state: Arc<Mutex<InstallState>>, ctx: egui::Context) {
                 set(InstallState::Installing(msg));
                 
                 runtime_log(&format!("[INSTALL] 尝试自源 {} 下载: {}", idx + 1, url));
-                let status = std::process::Command::new("curl")
-                    .args(["-k", "-L", "--connect-timeout", "30", "--retry", "2", "-o", zip_path.to_str().unwrap(), url])
-                    .status();
+                let mut cmd = std::process::Command::new("curl");
+                cmd.args(["-k", "-L", "--connect-timeout", "30", "--retry", "2", "-o", zip_path.to_str().unwrap(), url]);
+                #[cfg(target_os = "windows")]
+                {
+                    use std::os::windows::process::CommandExt;
+                    cmd.creation_flags(0x08000000);
+                }
+                let status = cmd.status();
                 
                 match status {
                     Ok(s) if s.success() => {
