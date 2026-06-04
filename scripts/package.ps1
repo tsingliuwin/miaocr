@@ -9,6 +9,12 @@ $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $ProjectRoot
 
+# Ensure cmake is on PATH (winget installs to this location)
+$cmakePath = "C:\Program Files\CMake\bin"
+if ((Test-Path $cmakePath) -and ($env:PATH -notlike "*CMake*")) {
+    $env:PATH = $cmakePath + ";" + $env:PATH
+}
+
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "  MiaoCR Release Packager" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
