@@ -2828,14 +2828,25 @@ fn main() -> Result<()> {
     let shared_ocr_rs_state = Arc::new(Mutex::new(InstallState::Unchecked));
     let shared_oar_ocr_state = Arc::new(Mutex::new(InstallState::Unchecked));
 
-    // 2. 设定始终置顶的悬浮窗口参数（使用系统标题栏和边框）
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([480.0, 300.0])
+        .with_position([100.0, 100.0])
+        .with_always_on_top()
+        .with_resizable(true)  // 允许拖动调整窗口大小
+        .with_min_inner_size([450.0, 200.0]);  // 设置最小尺寸
+
+    if let Ok(image) = image::load_from_memory(include_bytes!("../assets/logo.png")) {
+        let rgba = image.to_rgba8();
+        let (width, height) = rgba.dimensions();
+        viewport = viewport.with_icon(std::sync::Arc::new(egui::IconData {
+            rgba: rgba.into_raw(),
+            width,
+            height,
+        }));
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([480.0, 300.0])
-            .with_position([100.0, 100.0])
-            .with_always_on_top()
-            .with_resizable(true)  // 允许拖动调整窗口大小
-            .with_min_inner_size([450.0, 200.0]),  // 设置最小尺寸
+        viewport,
         ..Default::default()
     };
 
