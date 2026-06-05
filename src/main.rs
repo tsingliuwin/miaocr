@@ -108,19 +108,125 @@ fn save_temp_png(bgra: &[u8], width: u32, height: u32) -> Result<std::path::Path
     Ok(temp_img_path)
 }
 
+#[cfg(target_os = "macos")]
+fn check_macos_screen_capture_permission() -> (bool, bool) {
+    // 返回 (是否拥有权限, 是否支持该API)
+    unsafe {
+        let lib_path = "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics";
+        if let Ok(lib) = libloading::Library::new(lib_path) {
+            if let Ok(preflight) = lib.get::<unsafe extern "C" fn() -> bool>(b"CGPreflightScreenCaptureAccess") {
+                let has_perm = preflight();
+                return (has_perm, true);
+            }
+        }
+        (true, false)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn request_macos_screen_capture_permission() -> bool {
+    // 主动请求屏幕录制权限，这会触发系统弹窗
+    unsafe {
+        let lib_path = "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics";
+        if let Ok(lib) = libloading::Library::new(lib_path) {
+            if let Ok(request) = lib.get::<unsafe extern "C" fn() -> bool>(b"CGRequestScreenCaptureAccess") {
+                return request();
+            }
+        }
+        false
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_screen_capture_permission() -> bool {
+    // 综合检查和请求权限的函数
+    let (has_perm, supported) = check_macos_screen_capture_permission();
+    if !supported {
+        // API 不支持（旧系统），假设有权限
+        return true;
+    }
+    
+    if has_perm {
+        // 已经有权限
+        return true;
+    }
+    
+    // 没有权限，主动请求
+    runtime_log("[PERM] Screen capture permission not granted, requesting...");
+    let granted = request_macos_screen_capture_permission();
+    
+    // 再次检查权限状态
+    let (has_perm_after, _) = check_macos_screen_capture_permission();
+    if has_perm_after {
+        runtime_log("[PERM] Screen capture permission granted successfully");
+        return true;
+    }
+    
+    runtime_log(&format!("[PERM] Screen capture permission request result: {}, but still not granted. User may need to grant in System Settings.", granted));
+    false
+}
+
+fn get_tesseract_path() -> String {
+    // 方式 1：PATH 查找
+    let in_path = {
+        let mut cmd = std::process::Command::new("tesseract");
+        cmd.arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000);
+        }
+        cmd.status().map(|s| s.success()).unwrap_or(false)
+    };
+    if in_path {
+        return "tesseract".to_string();
+    }
+
+    // 方式 2：检查默认安装目录
+    #[cfg(target_os = "windows")]
+    {
+        let default_exe = r"C:\Program Files\Tesseract-OCR\tesseract.exe";
+        if std::path::Path::new(default_exe).exists() {
+            return default_exe.to_string();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let paths = [
+            "/opt/homebrew/bin/tesseract",
+            "/usr/local/bin/tesseract",
+        ];
+        for path in &paths {
+            if std::path::Path::new(path).exists() {
+                return path.to_string();
+            }
+        }
+    }
+
+    "tesseract".to_string()
+}
+
 fn ocr_tesseract(bgra: &[u8], width: u32, height: u32) -> Result<String> {
     let temp_path = save_temp_png(bgra, width, height)?;
 
-    // 显式将 TESSDATA_PREFIX 传入子进程，防止环境变量丢失
-    let tessdata_prefix = std::env::var("TESSDATA_PREFIX")
-        .unwrap_or_else(|_| r"C:\Program Files\Tesseract-OCR\tessdata".to_string());
-
-    let mut cmd = std::process::Command::new("tesseract");
+    let tesseract_exe = get_tesseract_path();
+    let mut cmd = std::process::Command::new(&tesseract_exe);
     cmd.arg(temp_path.to_str().unwrap())
         .arg("stdout")
         .arg("-l")
-        .arg("chi_sim")
-        .env("TESSDATA_PREFIX", &tessdata_prefix);
+        .arg("chi_sim");
+
+    if let Ok(tessdata_prefix) = std::env::var("TESSDATA_PREFIX") {
+        cmd.env("TESSDATA_PREFIX", &tessdata_prefix);
+    } else {
+        #[cfg(target_os = "windows")]
+        {
+            cmd.env("TESSDATA_PREFIX", r"C:\Program Files\Tesseract-OCR\tessdata");
+        }
+    }
 
     // Windows GUI 程序：禁止子进程弹出控制台窗口 (CREATE_NO_WINDOW = 0x08000000)
     #[cfg(target_os = "windows")]
@@ -145,7 +251,14 @@ fn ocr_tesseract(bgra: &[u8], width: u32, height: u32) -> Result<String> {
         }
         Err(e) => {
             if e.kind() == std::io::ErrorKind::NotFound {
-                Err(anyhow::anyhow!("未在系统 PATH 中找到 tesseract.exe\n请先安装 Tesseract OCR 并将其加入系统环境变量。"))
+                let err_msg = if cfg!(target_os = "windows") {
+                    "未在系统 PATH 中找到 tesseract.exe\n请先安装 Tesseract OCR 并将其加入系统环境变量。"
+                } else if cfg!(target_os = "macos") {
+                    "未在系统 PATH 中找到 tesseract\n请先通过 Homebrew 安装 Tesseract OCR（在终端运行 `brew install tesseract`）。"
+                } else {
+                    "未在系统 PATH 中找到 tesseract\n请先安装 Tesseract OCR 并将其加入系统环境变量。"
+                };
+                Err(anyhow::anyhow!("{}", err_msg))
             } else {
                 Err(anyhow::anyhow!("调用 Tesseract 失败: {}", e))
             }
@@ -674,10 +787,11 @@ enum InstallState {
 ///    若在默认目录找到，则顺手将其注入当前进程 PATH。
 /// exe 找到后调用 ensure_chi_sim() 确保中文训练数据可用。
 fn detect_tesseract() -> bool {
-    // 方式 1：PATH 查找
-    // Windows GUI 程序：禁止子进程弹出控制台窗口 (CREATE_NO_WINDOW = 0x08000000)
-    let in_path = {
-        let mut cmd = std::process::Command::new("tesseract");
+    let tesseract_exe = get_tesseract_path();
+    
+    // Check if the resolved path works
+    let works = {
+        let mut cmd = std::process::Command::new(&tesseract_exe);
         cmd.arg("--version")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
@@ -688,19 +802,17 @@ fn detect_tesseract() -> bool {
         }
         cmd.status().map(|s| s.success()).unwrap_or(false)
     };
-    if in_path {
-        ensure_chi_sim();
-        return true;
-    }
 
-    // 方式 2：检查默认安装目录（应对父进程 PATH 未刷新的情况）
-    let default_exe = std::path::Path::new(r"C:\Program Files\Tesseract-OCR\tesseract.exe");
-    if default_exe.exists() {
-        // 注入到当前进程 PATH，使后续 CLI 调用直接可用，无需重启
-        let tess_dir = r"C:\Program Files\Tesseract-OCR";
-        let cur_path = std::env::var("PATH").unwrap_or_default();
-        if !cur_path.contains(tess_dir) {
-            std::env::set_var("PATH", format!("{};{}", tess_dir, cur_path));
+    if works {
+        #[cfg(target_os = "windows")]
+        {
+            if tesseract_exe.contains("C:\\Program Files\\Tesseract-OCR") {
+                let tess_dir = r"C:\Program Files\Tesseract-OCR";
+                let cur_path = std::env::var("PATH").unwrap_or_default();
+                if !cur_path.contains(tess_dir) {
+                    std::env::set_var("PATH", format!("{};{}", tess_dir, cur_path));
+                }
+            }
         }
         ensure_chi_sim();
         return true;
@@ -723,12 +835,28 @@ fn ensure_chi_sim() {
         return;
     }
 
-    let sys_chi = std::path::Path::new(
-        r"C:\Program Files\Tesseract-OCR\tessdata\chi_sim.traineddata");
-    if sys_chi.exists() {
-        std::env::set_var("TESSDATA_PREFIX",
-            r"C:\Program Files\Tesseract-OCR\tessdata");
-        return;
+    #[cfg(target_os = "windows")]
+    {
+        let sys_chi = std::path::Path::new(r"C:\Program Files\Tesseract-OCR\tessdata\chi_sim.traineddata");
+        if sys_chi.exists() {
+            std::env::set_var("TESSDATA_PREFIX", r"C:\Program Files\Tesseract-OCR\tessdata");
+            return;
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let sys_paths = [
+            "/opt/homebrew/share/tessdata",
+            "/usr/local/share/tessdata",
+        ];
+        for path in &sys_paths {
+            let chi_path = std::path::Path::new(path).join("chi_sim.traineddata");
+            if chi_path.exists() {
+                std::env::set_var("TESSDATA_PREFIX", path);
+                return;
+            }
+        }
     }
 
     // 两处都没有，自动下载到用户目录（无需管理员权限）
@@ -760,7 +888,7 @@ fn ensure_chi_sim() {
         runtime_log("[TESSDATA] chi_sim.traineddata 下载完成");
         std::env::set_var("TESSDATA_PREFIX", &user_tessdata);
     } else {
-        runtime_log("[TESSDATA] chi_sim.traineddata 下载失败，请检查网络");
+        runtime_log("[TESSDATA] chi_sim.traineddata 下载失败，请检查 network");
     }
 }
 
@@ -1190,6 +1318,7 @@ fn start_rapid_install(state: Arc<Mutex<InstallState>>, ctx: egui::Context) {
 
 
 /// 后台异步安装 Tesseract（下载预编译安装包 + chi_sim，通过 UAC 一次性提权安装）
+#[cfg(target_os = "windows")]
 fn start_tesseract_install(state: Arc<Mutex<InstallState>>, ctx: egui::Context) {
     runtime_log("[INSTALL] Tesseract 安装开始");
     std::thread::spawn(move || {
@@ -1343,6 +1472,19 @@ fn start_tesseract_install(state: Arc<Mutex<InstallState>>, ctx: egui::Context) 
             ));
         }
     });
+}
+
+#[cfg(not(target_os = "windows"))]
+fn start_tesseract_install(state: Arc<Mutex<InstallState>>, ctx: egui::Context) {
+    runtime_log("[INSTALL] Tesseract macOS/Linux 提示安装");
+    let set = move |s: InstallState| {
+        *state.lock().unwrap() = s;
+        ctx.request_repaint();
+    };
+    #[cfg(target_os = "macos")]
+    set(InstallState::Failed("macOS 请在终端运行 `brew install tesseract` 安装".into()));
+    #[cfg(not(target_os = "macos"))]
+    set(InstallState::Failed("请先在系统上安装 Tesseract OCR".into()));
 }
 
 
@@ -1599,7 +1741,8 @@ fn ocr_region(
         return Ok(String::new());
     }
 
-    let image = screen.capture_area(local_x, local_y, capture_width, capture_height)?;
+    let image = screen.capture_area(local_x, local_y, capture_width, capture_height)
+        .map_err(|e| anyhow::anyhow!("SCREEN_CAPTURE_FAILED: {}", e))?;
     let raw: &[u8] = image.as_raw();
 
     // 动态缩放：对于小于 500x400 的中偏小选区，放大 2 倍以提升 OCR 解析精度
@@ -2254,6 +2397,14 @@ impl FloatApp {
         ui.horizontal(|ui| {
             let sel_btn = ui.button("⛶ 选区");
             if sel_btn.clicked() {
+                #[cfg(target_os = "macos")]
+                {
+                    let (has_perm, supported) = check_macos_screen_capture_permission();
+                    if supported {
+                        self.mac_permission_error = !has_perm;
+                    }
+                }
+
                 if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
                     if rect.min.x > -9000.0 && rect.min.y > -9000.0 {
                         self.float_pos = rect.min;
@@ -2305,6 +2456,47 @@ impl FloatApp {
             egui::Stroke::new(1.0, stroke_color),
         );
         ui.add_space(8.0);
+
+        #[cfg(target_os = "macos")]
+        if self.mac_permission_error {
+            ui.add_space(4.0);
+            ui.group(|ui| {
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("⚠️ 屏幕录制权限受限").color(egui::Color32::from_rgb(220, 38, 38)).strong().size(13.0));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("❌").clicked() {
+                                self.mac_permission_error = false;
+                            }
+                        });
+                    });
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("喵OCR 需要「屏幕录制」权限以截屏进行识别。\n若已弹出系统提示，请点击允许；若未弹出或已拒绝：\n\n1. 请打开「系统设置 -> 隐私与安全性 -> 屏幕录制」\n2. 勾选并启用「喵OCR」的录制权限\n3. 如果已勾选但无法识别，请先取消勾选，再重新勾选一遍\n4. ⚠️ 权限修改后，请务必完全退出喵OCR并重新启动！")
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(107, 114, 128))
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("🔄 重新请求权限").clicked() {
+                            runtime_log("[PERM] User manually requesting screen capture permission...");
+                            if ensure_screen_capture_permission() {
+                                self.mac_permission_error = false;
+                                runtime_log("[PERM] Permission granted after manual request");
+                            } else {
+                                runtime_log("[PERM] Permission still not granted after manual request");
+                            }
+                        }
+                        if ui.button("⚙️ 打开系统隐私设置").clicked() {
+                            let _ = std::process::Command::new("open")
+                                .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
+                                .status();
+                        }
+                    });
+                });
+            });
+            ui.add_space(4.0);
+        }
 
         // ── 内容展示区 ──
         let mut text_lock = self.text.lock().unwrap();
@@ -2374,6 +2566,7 @@ struct FloatApp {
     select_step: u8,
     frame_delay: u8,
     show_settings: bool,
+    mac_permission_error: bool,
 
     // OCR 共享状态
     ocr_region: Arc<Mutex<Option<(i32, i32, u32, u32)>>>,
@@ -2419,6 +2612,17 @@ impl eframe::App for FloatApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // 1. 截图隐藏逻辑的状态机处理
         if self.select_step == 1 {
+            // macOS: 在截图前确保已请求权限
+            #[cfg(target_os = "macos")]
+            {
+                if !ensure_screen_capture_permission() {
+                    runtime_log("[PERM] Failed to obtain screen capture permission before screenshot");
+                    self.mac_permission_error = true;
+                    self.select_step = 0;
+                    return;
+                }
+            }
+            
             // 先隐藏窗口的边框和标题栏，并移至屏幕外，使其被排除在截图之外。
             // 这里不能使用 Visible(false)，因为隐藏窗口后 Windows 不再调用 egui update()，会导致状态机卡死。
             ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
@@ -2464,6 +2668,10 @@ impl eframe::App for FloatApp {
                             height: info.height,
                             scale_factor: info.scale_factor,
                         });
+                        #[cfg(target_os = "macos")]
+                        {
+                            self.mac_permission_error = false;
+                        }
                     }
                 }
                 self.select_step = 3;
@@ -2508,6 +2716,10 @@ impl eframe::App for FloatApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(self.float_size));
                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(self.float_pos));
                 self.mode = AppMode::Float;
+                #[cfg(target_os = "macos")]
+                {
+                    self.mac_permission_error = true;
+                }
             }
             self.select_step = 0;
         }
@@ -3104,14 +3316,27 @@ fn main() -> Result<()> {
                                 }
                             }
                             Err(e) => {
-                                let msg = format!("识别失败: {}", e);
-                                let err_str = format!("[OCR ERROR] backend={:?} {}", backend, e);
-                                // 仅当错误内容变化时才写入运行日志，避免高频刷写
-                                if last_error.as_deref() != Some(&err_str) {
-                                    runtime_log(&err_str);
-                                    last_error = Some(err_str);
+                                let err_msg = e.to_string();
+                                if err_msg.contains("SCREEN_CAPTURE_FAILED") {
+                                    // Screen capture failed. Pause the OCR loop to avoid infinite system prompts
+                                    *paused_for_thread.lock().unwrap() = true;
+                                    let msg = if cfg!(target_os = "macos") {
+                                        "【屏幕录制权限受限】\n识别已自动暂停。\n请前往「系统设置 -> 隐私与安全性 -> 屏幕录制」开启并重新开启「喵OCR」的录制权限，然后重启软件。"
+                                    } else {
+                                        "【截图失败】识别已自动暂停。\n请检查系统截图权限。"
+                                    };
+                                    *text_for_thread.lock().unwrap() = msg.to_string();
+                                    runtime_log(&format!("[PERM] Screen capture failed, pausing loop: {}", err_msg));
+                                } else {
+                                    let msg = format!("识别失败: {}", e);
+                                    let err_str = format!("[OCR ERROR] backend={:?} {}", backend, e);
+                                    // 仅当错误内容变化时才写入运行日志，避免高频刷写
+                                    if last_error.as_deref() != Some(&err_str) {
+                                        runtime_log(&err_str);
+                                        last_error = Some(err_str);
+                                    }
+                                    *text_for_thread.lock().unwrap() = msg;
                                 }
-                                *text_for_thread.lock().unwrap() = msg;
                             }
                         }
                     }
@@ -3138,6 +3363,18 @@ fn main() -> Result<()> {
                 select_step: 0,
                 frame_delay: 0,
                 show_settings: false,
+                mac_permission_error: {
+                    #[cfg(target_os = "macos")]
+                    {
+                        // 应用启动时主动请求权限
+                        runtime_log("[PERM] Checking and requesting screen capture permission on startup...");
+                        !ensure_screen_capture_permission()
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        false
+                    }
+                },
                 ocr_region: shared_region,
                 paused: shared_paused,
                 text: shared_text,

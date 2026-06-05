@@ -2827,6 +2827,7 @@ dependencies = [
  "eframe",
  "egui",
  "image 0.25.10",
+ "libloading 0.8.9",
  "mouse_position",
  "oar-ocr",
  "ocr-rs",

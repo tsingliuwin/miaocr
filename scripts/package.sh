@@ -76,7 +76,7 @@ EOF
 # Codesign the app bundle (critical for macOS permissions to work correctly)
 echo -e "\033[33mCodesigning the app bundle...\033[0m"
 if command -v codesign &> /dev/null; then
-    codesign --force --deep --sign - "$APP_DIR"
+    codesign --force --deep --sign - --requirements '=designated => identifier "com.tsingliu.miaocr"' "$APP_DIR"
     echo -e "\033[32m  Codesign completed successfully\033[0m"
 else
     echo -e "\033[33m  Warning: codesign command not found, skipping codesigning\033[0m"
