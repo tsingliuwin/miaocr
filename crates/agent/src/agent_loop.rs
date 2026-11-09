@@ -53,40 +53,78 @@ impl<'a> Agent<'a> {
         registry: &ToolRegistry,
         runtime_context: Option<&str>,
     ) -> Result<String, String> {
+        let mut history = Vec::new();
+        self.run_turn(&mut history, user_msg, model, registry, runtime_context)
+    }
+
+    /// 多轮对话 + 工具调用。
+    ///
+    /// `history` 是该会话的历史消息（只含 user / assistant / tool，不含 system），
+    /// 本轮产生的 user、assistant、tool 消息都会追加进去，供下一轮继续使用。
+    /// 返回本轮最终助手回复。
+    pub fn run_turn(
+        &self,
+        history: &mut Vec<ChatMessage>,
+        user_msg: &str,
+        model: &str,
+        registry: &ToolRegistry,
+        runtime_context: Option<&str>,
+    ) -> Result<String, String> {
         let system = self.render_system()?;
         let user_content = match runtime_context {
             Some(ctx) if !ctx.is_empty() => format!("{ctx}\n\n{user_msg}"),
             _ => user_msg.to_string(),
         };
-        let mut messages = vec![
-            ChatMessage::new("system", system),
-            ChatMessage::new("user", user_content),
-        ];
-        let tools = registry.to_openai_tools();
 
+        trim_history(history);
+        history.push(ChatMessage::new("user", user_content));
+
+        let tools = registry.to_openai_tools();
         for _ in 0..8 {
+            let mut messages = Vec::with_capacity(history.len() + 1);
+            messages.push(ChatMessage::new("system", system.clone()));
+            messages.extend(history.iter().cloned());
+
             let req = ChatRequest {
                 model: model.to_string(),
-                messages: messages.clone(),
+                messages,
                 tools: tools.clone(),
             };
             let resp = self.client.chat(&req)?;
             if !resp.has_tool_calls() {
+                history.push(ChatMessage::new("assistant", resp.content.clone()));
                 return Ok(resp.content);
             }
 
             let tool_calls = resp.tool_calls;
-            messages.push(ChatMessage::assistant_with_tool_calls(tool_calls.clone()));
+            history.push(ChatMessage::assistant_with_tool_calls(tool_calls.clone()));
             for tc in &tool_calls {
                 let args: serde_json::Value =
                     serde_json::from_str(&tc.arguments).unwrap_or_else(|_| serde_json::json!({}));
                 let result = registry
                     .execute(&tc.name, args)
                     .unwrap_or_else(|e| format!("error: {e}"));
-                messages.push(ChatMessage::tool_result(tc.id.clone(), result));
+                history.push(ChatMessage::tool_result(tc.id.clone(), result));
             }
         }
         Err("tool loop exceeded max iterations".into())
+    }
+}
+
+/// 会话历史上限。超出后从最早的一轮 user 消息开始丢弃，保证不会把
+/// assistant(tool_calls) 和后续 tool 结果拆散，避免破坏 OpenAI 消息配对。
+const MAX_HISTORY_MESSAGES: usize = 40;
+
+fn trim_history(history: &mut Vec<ChatMessage>) {
+    if history.len() <= MAX_HISTORY_MESSAGES {
+        return;
+    }
+    let keep_from = history.len() - MAX_HISTORY_MESSAGES;
+    if let Some(offset) = history[keep_from..]
+        .iter()
+        .position(|message| message.role == "user")
+    {
+        history.drain(..keep_from + offset);
     }
 }
 
@@ -132,6 +170,54 @@ mod tests {
         fn run(&self, args: Value) -> Result<String, String> {
             Ok(args["text"].as_str().unwrap_or("").to_string())
         }
+    }
+
+    #[test]
+    fn run_turn_reuses_history_across_turns() {
+        let mut sp = SystemPrompt::new();
+        sp.add_section(PromptSection::new("agent:identity", -100, "You are Mia."))
+            .unwrap();
+
+        let client = CaptureClient::new("answer");
+        let agent = Agent::new(sp, &client);
+        let registry = ToolRegistry::new();
+        let mut history = Vec::new();
+
+        agent
+            .run_turn(&mut history, "first question", "test-model", &registry, None)
+            .unwrap();
+        agent
+            .run_turn(
+                &mut history,
+                "second question",
+                "test-model",
+                &registry,
+                Some("Current runtime context: region x=1"),
+            )
+            .unwrap();
+
+        assert_eq!(history.len(), 4);
+        assert_eq!(history[0].role, "user");
+        assert_eq!(history[1].role, "assistant");
+        assert_eq!(history[2].role, "user");
+        assert_eq!(history[3].role, "assistant");
+
+        let req = client.last_request().unwrap();
+        assert_eq!(req.messages.len(), 4); // system + user/assistant/user
+        assert_eq!(req.messages[1].content, "first question");
+        assert_eq!(req.messages[2].content, "answer");
+        assert!(req.messages[3].content.contains("second question"));
+        assert!(req.messages[3].content.starts_with("Current runtime context"));
+    }
+
+    #[test]
+    fn trim_history_starts_at_a_user_message() {
+        let mut history: Vec<ChatMessage> = (0..46)
+            .map(|i| ChatMessage::new(if i % 2 == 0 { "user" } else { "assistant" }, i.to_string()))
+            .collect();
+        trim_history(&mut history);
+        assert_eq!(history.len(), MAX_HISTORY_MESSAGES);
+        assert_eq!(history[0].role, "user");
     }
 
     #[test]

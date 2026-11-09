@@ -1,6 +1,6 @@
 # 喵OCR → 喵Agent：屏幕智能助手整体重构方案
 
-> 状态：**方案待评审**。本文件是设计文档，评审通过后再动代码。
+> 状态：**已实施（2026-11）**。分层、系统提示词组装与工具接缝已落地到 `crates/`；本文件保留为设计依据，与代码不一致处（如最终未单独建 `app` crate，装配并入 `crates/ui`）以代码与 `docs/ARCHITECTURE.md` 为准。
 > 目标：把 `miaocr` 从一个「纯 OCR 悬浮工具」升级为「以 OCR 为眼睛、LLM 为大脑的屏幕智能助手（Agent）」，UI 框架从 `egui` 迁移到 `gpui` + `gpui-component`，并借鉴 DeepSeek Harness 的系统提示词设计，为 Agent 新建一套系统提示词与提示词组装机制。
 
 ---

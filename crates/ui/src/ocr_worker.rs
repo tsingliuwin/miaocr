@@ -53,11 +53,15 @@ pub enum OcrJob {
         baidu: BaiduCfg,
         resp: smol::channel::Sender<anyhow::Result<String>>,
     },
-    /// 让 Agent 理解 OCR 文本（同步 HTTP + 工具循环）。
+    /// 让 Agent 回答用户问题（同步 HTTP + 多轮工具循环）。
     Agent {
         ctx: AgentContext,
         config: AgentConfig,
-        resp: smol::channel::Sender<Result<String, String>>,
+        /// 用户输入的问题；空串表示「请简要说明这段内容」。
+        question: String,
+        /// 会话历史（UI 持有，本轮结束后随回答一起返回）。
+        history: Vec<llm::ChatMessage>,
+        resp: smol::channel::Sender<Result<(String, Vec<llm::ChatMessage>), String>>,
     },
 }
 
@@ -104,9 +108,15 @@ pub fn spawn_ocr_worker() -> Sender<OcrJob> {
                         crate::safe_eprint(&format!("[wk] Region 完成, 耗时 {:?}", t0.elapsed()));
                         let _ = smol::block_on(resp.send(result));
                     }
-                    OcrJob::Agent { ctx, config, resp } => {
+                    OcrJob::Agent {
+                        ctx,
+                        config,
+                        question,
+                        history,
+                        resp,
+                    } => {
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            run_agent(&ctx, &config)
+                            run_agent(&ctx, &config, &question, history)
                         }))
                         .unwrap_or_else(|p| Err(format!("Agent 线程 panic: {p:?}")));
                         let _ = smol::block_on(resp.send(result));

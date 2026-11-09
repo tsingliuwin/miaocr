@@ -466,6 +466,10 @@ struct AppState {
     input_base_url: Entity<InputState>,
     input_baidu_token: Entity<InputState>,
     input_baidu_model: Entity<InputState>,
+    /// 自由提问输入框。
+    input_question: Entity<InputState>,
+    /// 多轮会话历史（只含 user/assistant/tool，不含 system）。
+    chat_history: Vec<llm::ChatMessage>,
     /// 保存/重载后的提示。
     settings_hint: String,
     show_settings: bool,
@@ -582,6 +586,9 @@ impl AppState {
         self.region = Some(region);
         self.paused = false;
         self.answer.clear();
+        self.chat_history.clear();
+        let question = self.input_question.clone();
+        question.update(cx, |state, cx| state.set_value("", window, cx));
         self.poll_gen = self.poll_gen.wrapping_add(1);
         let gen = self.poll_gen;
         let entity = cx.entity();
@@ -688,6 +695,7 @@ impl AppState {
     fn clear_output(&mut self, cx: &mut Context<Self>) {
         self.text.clear();
         self.answer.clear();
+        self.chat_history.clear();
         cx.notify();
     }
 
@@ -711,40 +719,54 @@ impl AppState {
         cx.notify();
     }
 
-    /// 把当前 OCR 文本交给 Agent 理解（工作线程执行，UI 不阻塞）。
+    /// 把当前 OCR 文本 + 用户问题交给 Agent（工作线程执行，UI 不阻塞）。
     fn ask_ai(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy {
             return;
         }
+        let question = self.input_question.read(cx).value().trim().to_string();
         let ocr_text = self.text.clone();
-        if ocr_text.is_empty() || ocr_text.starts_with("识别失败") {
+        let has_ocr = !ocr_text.is_empty() && !ocr_text.starts_with("识别失败");
+        // 没有 OCR 文本也允许提问：模型可自行调用 screenshot / ocr_read 观察。
+        if !has_ocr && question.is_empty() {
             return;
         }
+
+        // 发送后清空输入框；问题本身已被复制进本次任务。
+        let input = self.input_question.clone();
+        input.update(cx, |state, cx| state.set_value("", window, cx));
+
         // 让工作线程专注跑 Agent，避免轮询任务插队
         let was_paused = self.paused;
         self.paused = true;
         self.busy = true;
         self.answer = "正在思考…".to_string();
+
         let config = self.config.clone();
         let ctx = AgentContext {
             region: self.region,
             backend: self.backend.display_name().to_string(),
-            ocr_text: ocr_text.clone(),
+            ocr_text: if has_ocr { ocr_text } else { String::new() },
         };
+        // 历史用克隆：请求失败时 UI 里的旧会话仍然保留。
+        let history = self.chat_history.clone();
         let entity = cx.entity();
         let jobs = self.jobs.clone();
         cx.notify();
         window
             .spawn(cx, async move |cx: &mut AsyncWindowContext| {
-                let (resp_tx, resp_rx) = smol::channel::bounded::<Result<String, String>>(1);
+                let (resp_tx, resp_rx) =
+                    smol::channel::bounded::<Result<(String, Vec<llm::ChatMessage>), String>>(1);
                 let sent = jobs
                     .send(OcrJob::Agent {
                         ctx,
                         config,
+                        question,
+                        history,
                         resp: resp_tx,
                     })
                     .is_ok();
-                let answer = if sent {
+                let result = if sent {
                     resp_rx
                         .recv()
                         .await
@@ -752,12 +774,14 @@ impl AppState {
                 } else {
                     Err("Agent 工作线程不可用".into())
                 };
-                let msg = match answer {
-                    Ok(a) => a,
-                    Err(e) => format!("AI 失败: {e}"),
-                };
                 cx.update_entity(&entity, |state: &mut AppState, cx: &mut Context<AppState>| {
-                    state.answer = msg;
+                    match result {
+                        Ok((answer, history)) => {
+                            state.answer = answer;
+                            state.chat_history = history;
+                        }
+                        Err(e) => state.answer = format!("AI 失败: {e}"),
+                    }
                     state.busy = false;
                     state.paused = was_paused;
                     cx.notify();
@@ -928,6 +952,14 @@ impl AppState {
     fn reload_config(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.config = AgentConfig::load();
         self.settings = AppSettings::load();
+        let backend = self
+            .settings
+            .selected_backend
+            .as_deref()
+            .map(backend_from_name)
+            .unwrap_or_else(default_backend);
+        self.backend = backend;
+        tools::set_current_backend(backend);
         let cfg = self.config.clone();
         let s = self.settings.clone();
         self.input_api_key
@@ -1127,6 +1159,7 @@ impl AppState {
                         MouseButton::Left,
                         cx.listener(move |this, _ev, _w, cx| {
                             this.backend = b;
+                            tools::set_current_backend(b);
                             this.settings.selected_backend = Some(b.log_name().to_string());
                             this.settings.save();
                             this.engine_menu_open = false;
@@ -1382,11 +1415,37 @@ fn render_float(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
                                     .title(EmptyTitle::new().child("暂无识别内容"))
                                     .description(
                                         EmptyDescription::new()
-                                            .child("点击「选区」框选屏幕，再点「问 AI」理解内容"),
+                                            .child("点击「选区」框选屏幕；识别后可在下方直接提问"),
                                     ),
                             )
                             .into_any_element()
-                    }),
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .pt_2()
+                            .border_t_1()
+                            .border_color(border)
+                            .child(div().flex_1().child(Input::new(&self.input_question)))
+                            .child(
+                                Button::new("send-question")
+                                    .primary()
+                                    .label("发送")
+                                    .on_click({
+                                        let e = entity.clone();
+                                        move |_ev, window, cx| {
+                                            e.update(
+                                                cx,
+                                                |s: &mut AppState, cx: &mut Context<AppState>| {
+                                                    s.ask_ai(window, cx);
+                                                },
+                                            );
+                                        }
+                                    }),
+                            ),
+                    ),
             )
             // ── 底栏 ──
             .child(
@@ -1640,6 +1699,7 @@ fn main() {
             .as_deref()
             .map(backend_from_name)
             .unwrap_or_else(default_backend);
+        tools::set_current_backend(backend);
         gpui_kit::open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
@@ -1680,6 +1740,9 @@ fn main() {
                         .placeholder("PaddleOCR-VL-1.6")
                         .default_value(settings.baidu_model.clone())
                 });
+                let input_question = cx.new(|cx| {
+                    InputState::new(window, cx).placeholder("针对识别内容提问，点「发送」…")
+                });
                 cx.new(|_| AppState {
                     jobs: jobs.clone(),
                     text: String::new(),
@@ -1693,6 +1756,8 @@ fn main() {
                     input_base_url,
                     input_baidu_token,
                     input_baidu_model,
+                    input_question,
+                    chat_history: Vec::new(),
                     settings_hint: String::new(),
                     show_settings: start_in_settings,
                     engine_menu_open: false,

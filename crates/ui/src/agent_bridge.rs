@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use agent::{order, render_context_snapshot, PromptContext, PromptSection, SystemPrompt};
-use llm::OpenAiCompatibleClient;
+use llm::{ChatMessage, OpenAiCompatibleClient};
 use serde::{Deserialize, Serialize};
 
 /// 应用数据目录（~/.miaocr）。
@@ -188,10 +188,18 @@ fn snapshot_body(ctx: &AgentContext) -> String {
     lines.join("\n")
 }
 
-/// 把 OCR 文本 + 运行时快照交给 Agent 理解（进入工具调用循环）。
-pub fn run_agent(ctx: &AgentContext, config: &AgentConfig) -> Result<String, String> {
+/// 把 OCR 文本 + 运行时快照 + 用户问题交给 Agent（多轮 + 工具循环）。
+///
+/// `history` 是上一轮返回的会话历史；返回 `(本轮回答, 更新后的历史)`。
+/// 调用方（UI / worker）负责保存历史，并在重新选区或清空时丢弃它。
+pub fn run_agent(
+    ctx: &AgentContext,
+    config: &AgentConfig,
+    question: &str,
+    mut history: Vec<ChatMessage>,
+) -> Result<(String, Vec<ChatMessage>), String> {
     if config.api_key.trim().is_empty() {
-        return Err("未配置 API Key：请编辑 ~/.miaocr/agent_config.json 填入 api_key".into());
+        return Err("未配置 API Key：请在设置页填入，或编辑 ~/.miaocr/agent_config.json".into());
     }
     let mut sp = build_system_prompt(&config.model, &ctx.backend);
     let registry = tools::build_default_tools();
@@ -204,12 +212,27 @@ pub fn run_agent(ctx: &AgentContext, config: &AgentConfig) -> Result<String, Str
 
     let client = OpenAiCompatibleClient::new(config.base_url.clone(), config.api_key.clone());
     let agent = agent::Agent::new(sp, &client);
-    let prompt = format!(
-        "以下是我从屏幕上识别到的文字：\n{}\n\n请简要说明这段内容。\
-         若需要识别屏幕上其它区域，可调用 ocr_read 工具（不要臆测未见内容）。",
-        ctx.ocr_text
-    );
-    agent.run_with_tools_ctx(&prompt, &config.model, &registry, Some(&snapshot))
+
+    let ocr = if ctx.ocr_text.trim().is_empty() {
+        "（当前没有识别到文字，可调用 screenshot 或 ocr_read 获取）"
+    } else {
+        ctx.ocr_text.trim()
+    };
+    let question = question.trim();
+    let prompt = if question.is_empty() {
+        format!(
+            "以下是我从屏幕上识别到的文字：\n{ocr}\n\n请简要说明这段内容。\
+             若需要识别屏幕上其它区域，可调用 ocr_read 工具（不要臆测未见内容）。"
+        )
+    } else {
+        format!(
+            "以下是我从屏幕上识别到的文字：\n{ocr}\n\n我的问题：{question}\n\n\
+             如果现有文字不足以回答，可调用 ocr_read / screenshot 工具补充观察；不要臆测未见内容。"
+        )
+    };
+
+    let answer = agent.run_turn(&mut history, &prompt, &config.model, &registry, Some(&snapshot))?;
+    Ok((answer, history))
 }
 
 #[cfg(test)]

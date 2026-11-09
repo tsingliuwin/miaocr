@@ -14,7 +14,7 @@
 - **自适应轮询**：选区生效后常驻识别，按上一轮实际耗时动态调整间隔（120~1260ms）；可随时暂停 / 继续。
 - **八大 OCR 引擎**：Windows 原生、macOS 原生、PP-OCRv5 (MNN 内置)、OarOCR (ONNX 内置)、PaddleOCR-json、RapidOCR-json、Tesseract、百度 AI Studio（云端）。本地引擎支持界面内一键下载安装，下载走多镜像轮询。
 - **智能预处理**：小区域（<500×400）自动 2x Catmull-Rom 放大；原生 / Tesseract 引擎自动应用大津法二值化与智能反色，适配深色浅色背景。
-- **问 AI**：把识别结果连同运行时快照（选区、引擎、最近文本）交给 LLM，支持 DeepSeek / OpenAI 兼容接口与 function calling 工具循环。
+- **问 AI**：把识别结果连同运行时快照（选区、引擎、最近文本）交给 LLM；支持自由提问与多轮对话，工具调用循环兼容 DeepSeek / OpenAI 接口。
 - **设置页**：模型 / API Key / 百度 Token 等全部在界面内直接编辑（gpui-component `Input`），保存即生效。
 - **置顶 + 复制 + 清空**：一键置顶（Win32 `SetWindowPos`），识别结果可复制到剪贴板。
 

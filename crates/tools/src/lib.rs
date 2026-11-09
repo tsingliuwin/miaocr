@@ -1,14 +1,44 @@
 //! Agent 工具箱：把「眼睛」（vision）能力包装成模型可调用的工具。
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use agent::{Tool, ToolRegistry};
 use enigo::{Keyboard, Mouse};
 use serde_json::Value;
 use vision::BackendType;
 
+/// 当前 OCR 引擎。UI 在启动和切换引擎时写入，`ocr_read` 在模型未显式
+/// 指定 backend 时使用它，保证工具行为与用户在界面上选择的引擎一致。
+static CURRENT_BACKEND: Mutex<Option<BackendType>> = Mutex::new(None);
+
+/// 平台自带的 OCR 引擎。
+fn native_backend() -> BackendType {
+    if cfg!(target_os = "macos") {
+        BackendType::MacNative
+    } else {
+        BackendType::WindowsNative
+    }
+}
+
+/// 由 UI 同步当前引擎（启动时、切换引擎时、重载配置时调用）。
+pub fn set_current_backend(backend: BackendType) {
+    if let Ok(mut guard) = CURRENT_BACKEND.lock() {
+        *guard = Some(backend);
+    }
+}
+
+/// 当前引擎；未设置时回落到平台原生引擎。
+pub fn current_backend() -> BackendType {
+    CURRENT_BACKEND
+        .lock()
+        .ok()
+        .and_then(|guard| *guard)
+        .unwrap_or_else(native_backend)
+}
+
 fn parse_backend(name: Option<&str>) -> BackendType {
     match name {
+        None => current_backend(),
         Some("tesseract") => BackendType::Tesseract,
         Some("ocr_rs") | Some("ppocrv5") | Some("mnn") => BackendType::OcrRs,
         Some("oar") | Some("oarocr") | Some("onnx") => BackendType::OarOcr,
@@ -16,7 +46,7 @@ fn parse_backend(name: Option<&str>) -> BackendType {
         Some("rapid") => BackendType::RapidOcr,
         Some("baidu") => BackendType::BaiduAiStudio,
         Some("mac") => BackendType::MacNative,
-        _ => BackendType::WindowsNative,
+        Some(_) => native_backend(),
     }
 }
 
@@ -28,7 +58,7 @@ impl Tool for OcrReadTool {
         "ocr_read"
     }
     fn description(&self) -> &str {
-        "Read text in a screen region via OCR. Args (all optional): x, y, w, h (int, defaults to top-left 800x500), backend (string: windows_native|tesseract|ocr_rs|oar|paddle|rapid|baidu|mac)."
+        "Read text in a screen region via OCR. Args (all optional): x, y, w, h (int, defaults to top-left 800x500), backend (string: windows_native|tesseract|ocr_rs|oar|paddle|rapid|baidu|mac; omit to use the app's current engine)."
     }
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -420,10 +450,19 @@ mod tests {
     }
 
     #[test]
-    fn parse_backend_defaults_and_maps() {
-        assert_eq!(parse_backend(None), BackendType::WindowsNative);
+    fn parse_backend_maps_explicit_names() {
         assert_eq!(parse_backend(Some("mnn")), BackendType::OcrRs);
         assert_eq!(parse_backend(Some("onnx")), BackendType::OarOcr);
         assert_eq!(parse_backend(Some("paddle")), BackendType::PaddleOcr);
+    }
+
+    #[test]
+    fn current_backend_defaults_to_native_and_can_be_set() {
+        // 恢复为未设置状态不可行（OnceCell 语义），测试内直接设置后校验。
+        assert_eq!(parse_backend(Some("unknown")), native_backend());
+        set_current_backend(BackendType::Tesseract);
+        assert_eq!(current_backend(), BackendType::Tesseract);
+        assert_eq!(parse_backend(None), BackendType::Tesseract);
+        set_current_backend(native_backend());
     }
 }

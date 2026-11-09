@@ -49,11 +49,12 @@ miaocr/                    (workspace root，虚拟 manifest，无根包)
   → 松开 → 坐标映射 → vision::ocr_region(区域, 引擎)
   → OCR 文本回显（异步 window.spawn + update_entity）
 
-「🤖 问 AI」
+「问 AI」
+  → 输入框取用户问题（空问题则默认「简要说明这段内容」）
   → agent::SystemPrompt 组装（identity/persona + 10 工具的指导 section + schema）
-  → Agent::run_with_tools → LLM（OpenAI/DeepSeek function calling）
+  → Agent::run_turn（system + 会话历史 + 运行时快照 + 新问题）→ LLM
   → 若 LLM 请求工具 → ToolRegistry::execute（含 catch_unwind 守卫）→ 结果回传
-  → 多轮直到最终解答 → 回显
+  → 多轮直到最终解答 → 回显；历史随回答返回并由 UI 持有，供下一问继续
 ```
 
 选区交互细节：
@@ -123,9 +124,11 @@ cargo run -p miaocr-ui
 | ui（选区 + 持续轮询 + 暂停/复制/清空 + 置顶 + 引擎 + 设置 + 问 AI）| ✅ |
 | 设置页（component 0.9 `Input` 输入框 + 内联保存/重载）| ✅ |
 | gpui-kit 0.9 迁移（gpui-pre 0.3.11 + component 0.9）| ✅ |
-| 单元测试（agent 18 + tools 4 + ui 4，0 失败）| ✅ |
+| 单元测试（agent 20 + tools 5 + ui 4，0 失败）| ✅ |
 | 真实 DeepSeek 端到端验证 | ⏳ 需 API Key |
 | 百度云端 OCR 真机调用 | ⏳ 需消耗额度，仅验证参数透传 |
 | gpui-component 现成组件（GroupBox/Checkbox/Tag/Empty/Input/Icon/Scroll）| ✅ 已替换手写 div |
 | egui 旧入口 / poc / 旧权限文档清理 | ✅ 已移除 |
 | shell 工具 | ✅ 已实现，默认不注册（`build_default_tools_with_shell` 显式 opt-in）|
+| 「问 AI」自由提问 + 多轮会话 | ✅ 历史由 UI 持有，重新选区/清空时重置；超过 40 条按整轮裁剪 |
+| `ocr_read` 默认引擎 | ✅ 未显式指定时使用 UI 当前引擎（`tools::set_current_backend` 同步）|
