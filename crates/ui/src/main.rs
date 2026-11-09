@@ -23,6 +23,8 @@ use vision::{BackendType, InstallState};
 mod agent_bridge;
 mod mac_perm;
 mod ocr_worker;
+#[cfg(target_os = "windows")]
+mod region_picker;
 mod win_top;
 use agent_bridge::{data_dir, AgentConfig, AgentContext, AppSettings};
 use ocr_worker::{spawn_ocr_worker, BaiduCfg, OcrJob};
@@ -38,6 +40,7 @@ const ENGINE_OPTIONS: &[(BackendType, &str)] = &[
     (BackendType::BaiduAiStudio, "百度 AI Studio (云端)"),
 ];
 
+#[cfg(not(target_os = "windows"))]
 /// 选区覆盖窗口与主窗口共享的状态。
 struct SelectShared {
     image: Option<Arc<RenderImage>>,
@@ -52,8 +55,10 @@ struct SelectShared {
     cancelled: bool,
 }
 
+#[cfg(not(target_os = "windows"))]
 static SELECT: std::sync::OnceLock<std::sync::Mutex<SelectShared>> = std::sync::OnceLock::new();
 
+#[cfg(not(target_os = "windows"))]
 fn select_shared() -> &'static std::sync::Mutex<SelectShared> {
     SELECT.get_or_init(|| {
         std::sync::Mutex::new(SelectShared {
@@ -69,6 +74,7 @@ fn select_shared() -> &'static std::sync::Mutex<SelectShared> {
     })
 }
 
+#[cfg(not(target_os = "windows"))]
 /// 选区遮罩：选区内保持原图亮度，选区外压暗。
 fn mask_panel(x: f32, y: f32, w: f32, h: f32) -> Div {
     div()
@@ -80,6 +86,7 @@ fn mask_panel(x: f32, y: f32, w: f32, h: f32) -> Div {
         .bg(rgba(0x000000a0))
 }
 
+#[cfg(not(target_os = "windows"))]
 /// 四个角上的方形手柄。
 fn corner_handles(x: f32, y: f32, w: f32, h: f32) -> Vec<Div> {
     let s = 3.0f32;
@@ -98,6 +105,7 @@ fn corner_handles(x: f32, y: f32, w: f32, h: f32) -> Vec<Div> {
         .collect()
 }
 
+#[cfg(not(target_os = "windows"))]
 /// 1px 十字参考线。
 fn crosshair(hover: Point<Pixels>, vw: f32, vh: f32) -> [Div; 2] {
     let hx: f32 = hover.x.into();
@@ -120,6 +128,7 @@ fn crosshair(hover: Point<Pixels>, vw: f32, vh: f32) -> [Div; 2] {
     ]
 }
 
+#[cfg(not(target_os = "windows"))]
 /// 顶部居中的操作提示胶囊。
 fn hint_pill(text: &str) -> Div {
     div()
@@ -141,12 +150,14 @@ fn hint_pill(text: &str) -> Div {
         )
 }
 
+#[cfg(not(target_os = "windows"))]
 /// 选区覆盖窗口的视图。
 struct SelectView {
     /// 键盘焦点：覆盖窗口没有可聚焦元素时 Esc 收不到，必须自己持有一个。
     focus: FocusHandle,
 }
 
+#[cfg(not(target_os = "windows"))]
 impl Render for SelectView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (shot, drag_start, drag_end, hover, screen_size) = {
@@ -374,6 +385,7 @@ impl Render for SelectView {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 /// 写入选区共享状态，并在「截屏所在的那块显示器」上打开全屏覆盖窗口。
 ///
 /// 注意：不要用 `app.displays()` 反查显示器——GPUI 的 display 坐标与 Win32 的
@@ -457,6 +469,10 @@ struct AppState {
     /// 最近一次 AI 解答（与 text 分开显示，避免被轮询覆盖）。
     answer: String,
     busy: bool,
+    /// 选区进行中（防止重复点击）。
+    selecting: bool,
+    /// 临时状态提示（选区时显示在底栏）。
+    status_hint: String,
     backend: BackendType,
     config: AgentConfig,
     settings: AppSettings,
@@ -503,7 +519,66 @@ impl AppState {
         }
     }
 
-    /// 点击「选区」：工作线程截屏，回主线程打开全屏覆盖窗口。
+    /// 点击「选区」：Windows 下由工作线程全局轮询鼠标，拖拽时只显示细边框。
+    #[cfg(target_os = "windows")]
+    fn start_select(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        tlog("start_select: 入口(主线程, 原生选区)");
+        if !mac_perm::ensure() {
+            self.text = "缺少屏幕录制权限，请到 系统设置 → 隐私与安全性 → 屏幕录制 中授权后重试".into();
+            cx.notify();
+            return;
+        }
+        if self.selecting {
+            return;
+        }
+
+        let entity = cx.entity();
+        let jobs = self.jobs.clone();
+        let was_paused = self.paused;
+        self.selecting = true;
+        self.paused = true;
+        self.status_hint = "请在屏幕上拖拽选择区域（右键 / Esc 取消）".into();
+        cx.notify();
+
+        let (resp_tx, resp_rx) =
+            smol::channel::bounded::<Result<Option<(i32, i32, u32, u32)>, String>>(1);
+        window
+            .spawn(cx, async move |cx: &mut AsyncWindowContext| {
+                let sent = jobs.send(OcrJob::PickRegion { resp: resp_tx }).is_ok();
+                let result = if sent {
+                    resp_rx
+                        .recv()
+                        .await
+                        .unwrap_or_else(|_| Err("选区工作线程已退出".into()))
+                } else {
+                    Err("选区工作线程不可用".into())
+                };
+                cx.update_entity(&entity, |s: &mut AppState, cx: &mut Context<AppState>| {
+                    s.selecting = false;
+                    s.status_hint.clear();
+                    match result {
+                        Ok(Some(region)) => {
+                            tlog(&format!("start_select: 收到选区 {region:?}"));
+                            s.pending_region = Some(region);
+                        }
+                        Ok(None) => {
+                            tlog("start_select: 用户取消了选区");
+                            s.paused = was_paused;
+                        }
+                        Err(e) => {
+                            tlog(&format!("start_select: 选区失败 {e}"));
+                            s.text = format!("选区失败: {e}");
+                            s.paused = was_paused;
+                        }
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+    }
+
+    /// 点击「选区」：非 Windows 平台沿用全屏覆盖层。
+    #[cfg(not(target_os = "windows"))]
     fn start_select(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         tlog("start_select: 入口(主线程)");
         if !mac_perm::ensure() {
@@ -666,6 +741,9 @@ impl AppState {
     }
 
     fn status_line(&self) -> String {
+        if !self.status_hint.is_empty() {
+            return self.status_hint.clone();
+        }
         if self.region.is_none() {
             return "就绪".to_string();
         }
@@ -1593,6 +1671,7 @@ fn tlog(msg: &str) {
     safe_eprint(&format!("[ui +{:?}ms] {msg}", t0.elapsed().as_millis()));
 }
 
+#[cfg(not(target_os = "windows"))]
 fn cursor_pos() -> (i32, i32) {
     #[cfg(target_os = "windows")]
     {
@@ -1657,6 +1736,7 @@ fn main() {
             }
         })
         .detach();
+        #[cfg(not(target_os = "windows"))]
         if probe {
             let jobs_probe = jobs.clone();
             cx.spawn(async move |cx: &mut AsyncApp| {
@@ -1686,6 +1766,22 @@ fn main() {
             })
             .detach();
         }
+
+        #[cfg(target_os = "windows")]
+        if probe {
+            cx.spawn(async move |cx: &mut AsyncApp| {
+                tlog("[probe] 1 秒后启动原生选区");
+                Timer::after(std::time::Duration::from_secs(1)).await;
+                let result = cx
+                    .background_executor()
+                    .spawn(async { region_picker::pick_region() })
+                    .await;
+                tlog(&format!("[probe] 选区结束: {result:?}"));
+                std::process::exit(if result.is_ok() { 0 } else { 1 });
+            })
+            .detach();
+        }
+
         vision::init(
             data_dir(),
             Arc::new(|msg: &str| safe_eprint(&format!("[vision] {msg}"))),
@@ -1748,6 +1844,8 @@ fn main() {
                     text: String::new(),
                     answer: String::new(),
                     busy: false,
+                    selecting: false,
+                    status_hint: String::new(),
                     backend,
                     config,
                     settings,

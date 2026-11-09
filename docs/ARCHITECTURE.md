@@ -19,7 +19,7 @@ miaocr/                    (workspace root，虚拟 manifest，无根包)
 │   └── src/{lib,agent_loop,tool}.rs
 ├── crates/llm             模型接缝：OpenAI/DeepSeek 兼容 + function calling + Mock
 ├── crates/ui              界面：gpui-kit 悬浮窗 + 选区 + 引擎 + 设置 + 问 AI（全异步）
-│   └── src/{main,agent_bridge,ocr_worker,win_top,mac_perm}.rs
+│   └── src/{main,agent_bridge,ocr_worker,region_picker,win_top,mac_perm}.rs
 ├── 3rd_party/{ocr-rs,oar-ocr}   内置 MNN / ONNX 推理引擎
 ├── docs/                  方案 + 系统提示词 + 本文件
 └── scripts/               构建 / 打包脚本
@@ -44,9 +44,11 @@ miaocr/                    (workspace root，虚拟 manifest，无根包)
 
 ```
 选区拖拽（crates/ui）
-  → 截图（worker 线程）→ 在截屏那块屏上开全屏覆盖层
-  → 拖拽：四块遮罩（选区内保持原图亮度、外部压暗）+ 实时尺寸徽标 + 四角手柄 + 十字参考线
-  → 松开 → 坐标映射 → vision::ocr_region(区域, 引擎)
+  → 点击「选区」→ worker 线程进入 pick_region()（GDI 截全虚拟桌面 → 置顶覆盖层）
+  → 覆盖层接管输入：未选中区域压暗 55%、选区内保持原亮度实时跟随拖拽，
+    附带十字线 / 四角手柄 / 尺寸徽标 / 8× 放大镜（坐标 + 取色）/
+    顶部提示胶囊（出现在鼠标所在显示器）
+  → 松开 → 虚拟桌面物理坐标 → vision::ocr_region(区域, 引擎)
   → OCR 文本回显（异步 window.spawn + update_entity）
 
 「问 AI」
@@ -57,12 +59,19 @@ miaocr/                    (workspace root，虚拟 manifest，无根包)
   → 多轮直到最终解答 → 回显；历史随回答返回并由 UI 持有，供下一问继续
 ```
 
-选区交互细节：
-- **取消**：右键或 Esc（覆盖层自持 `FocusHandle` 并 `track_focus`，否则键盘事件无处投递）；
-  取消信号走 `SelectShared.cancelled`，主窗口等待任务轮询后退出。
-- **过小选区**（≤10px）：边框与徽标转红显示「太小」，松开后原地重置，可继续重选。
-- **坐标换算**：视口逻辑像素 → 屏幕物理像素按 `screen_size / viewport_size` 缩放，
-  再叠加截屏返回的屏幕原点；徽标里显示的是换算后的物理像素。
+选区交互细节（Windows，`crates/ui/src/region_picker.rs`，Snipaste / 系统截图风格）：
+- **截图覆盖层**：进入时 GDI 一次 BitBlt 截下整个虚拟桌面（多屏一次到位），做成
+  原图 + 55% 压暗图两份 DIB；置顶覆盖窗口（`WS_POPUP + TOPMOST + NOACTIVATE + TOOLWINDOW`）
+  接管全桌面：选区外压暗、选区内 punch-through 保持原亮度，拖拽实时跟随。
+- **输入捕获**：覆盖层天然独占鼠标事件（消息驱动，底层应用收不到拖拽/右键，
+  不会再误选底层文字）；Esc 用 `GetAsyncKeyState` 每 10ms 轮询——覆盖窗口不抢
+  键盘焦点，而低级钩子回调超时会被系统静默移除（踩过的坑），不宜装钩子。
+- **渲染**：纯 GDI 脏区重绘——dim 铺底擦除旧装饰 → 选区换 bright → 叠加边框 /
+  手柄 / 徽标 / 十字线 / 放大镜 → 一次 BitBlt 呈现；`WM_ERASEBKGND` 直接跳过，无闪烁。
+- **多屏 / DPI**：窗口即整个虚拟桌面，client 坐标 = 物理坐标 - 虚拟原点，
+  天然支持任意显示器、跨屏拖拽与负坐标副屏，无需换算。
+- **过小选区**（≤10px）：松开后原地重置，可继续拖拽；单击不会退出选区模式。
+- macOS 仍保留旧的截图覆盖层实现（遮罩/手柄/徽标用 GPUI 画），后续再对齐。
 
 关键点：
 - **模型可见 ⟺ 可追溯**：工具 schema 与系统提示词「工具指导 section」由 `ToolRegistry::add_to_prompt` 同源生成，杜绝漂移。
@@ -130,5 +139,7 @@ cargo run -p miaocr-ui
 | gpui-component 现成组件（GroupBox/Checkbox/Tag/Empty/Input/Icon/Scroll）| ✅ 已替换手写 div |
 | egui 旧入口 / poc / 旧权限文档清理 | ✅ 已移除 |
 | shell 工具 | ✅ 已实现，默认不注册（`build_default_tools_with_shell` 显式 opt-in）|
+| Windows 原生选区 | ✅ 截图覆盖层 + 压暗遮罩 + 十字线 + 放大镜 + 尺寸徽标，纯 GDI 脏区重绘，支持多屏/跨屏 |
+| macOS 选区 | ⏳ 仍用旧截图覆盖层，待迁移为原生边框选区 |
 | 「问 AI」自由提问 + 多轮会话 | ✅ 历史由 UI 持有，重新选区/清空时重置；超过 40 条按整轮裁剪 |
 | `ocr_read` 默认引擎 | ✅ 未显式指定时使用 UI 当前引擎（`tools::set_current_backend` 同步）|
