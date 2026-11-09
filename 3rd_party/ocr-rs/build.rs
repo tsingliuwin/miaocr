@@ -723,7 +723,13 @@ fn build_mnn_with_cmake(
         config.define("MNN_VULKAN", "ON");
     }
 
-    println!("cargo:rerun-if-changed=MNN/CMakeLists.txt");
+    // 只监听真正参与构建的 CMakeLists.txt。
+    // 原先是写死的相对路径 "MNN/CMakeLists.txt"，该文件并不存在，
+    // 导致 cargo 把本构建脚本永远判为 dirty，每次构建都重编整个 MNN。
+    println!(
+        "cargo:rerun-if-changed={}",
+        mnn_source_dir.join("CMakeLists.txt").display()
+    );
 
     config.build()
 }

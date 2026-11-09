@@ -41,16 +41,17 @@ Write-Host "  Directory ready" -ForegroundColor Green
 # 3. Copy required files
 $ReleaseDir = Join-Path $ProjectRoot "target\release"
 
-# miaocr.exe is always required
+# miaocr.exe 是唯一发布的产物（egui 版已移除）
 Write-Host "[3/4] Copying files..." -ForegroundColor Yellow
-$exe = Join-Path $ReleaseDir "miaocr.exe"
+$exeName = "miaocr.exe"
+$exe = Join-Path $ReleaseDir $exeName
 if (-not (Test-Path $exe)) {
-    Write-Host "  ERROR: miaocr.exe not found!" -ForegroundColor Red
+    Write-Host "  ERROR: $exeName not found!" -ForegroundColor Red
     exit 1
 }
 Copy-Item $exe $DistPath
 $exeSize = [math]::Round((Get-Item $exe).Length / 1MB, 2)
-Write-Host "  miaocr.exe - $exeSize MB" -ForegroundColor Green
+Write-Host "  $exeName - $exeSize MB" -ForegroundColor Green
 
 # MNN.dll: only needed when using prebuilt MNN (not build-from-source)
 $mnnDll = Join-Path $ReleaseDir "MNN.dll"
