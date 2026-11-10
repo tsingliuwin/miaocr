@@ -11,11 +11,10 @@
 ## 核心特性
 
 - **动态屏幕选区**：点击「选区」后截图覆盖层接管全屏（Snipaste 风格）：未选中区域压暗、选区内保持原亮度实时跟随拖拽；十字线、8 倍放大镜（坐标 + 取色）、实时尺寸徽标、四角手柄；纯 GDI 脏区重绘无闪烁，支持任意显示器与跨屏；右键 / Esc 取消；单击或选区过小会原地重置。
-- **自适应轮询**：选区生效后常驻识别，按上一轮实际耗时动态调整间隔（120~1260ms）；可随时暂停 / 继续。
-- **八大 OCR 引擎**：Windows 原生、macOS 原生、PP-OCRv5 (MNN 内置)、OarOCR (ONNX 内置)、PaddleOCR-json、RapidOCR-json、Tesseract、百度 AI Studio（云端）。本地引擎支持界面内一键下载安装，下载走多镜像轮询。
+- **自适应轮询**：选区生效后常驻识别；间隔跟随内容活动——变化时贴回下限快速跟进（120ms+OCR 耗时），不变时逐轮放宽 1.5 倍直到 1260ms，可随时暂停 / 继续。
+- **八大 OCR 引擎**：Windows 原生、macOS 原生、PP-OCRv5 (MNN 内置)、PP-OCRv6 (ONNX 内置，单模型 50 语言)、PaddleOCR-json、RapidOCR-json、Tesseract、百度 AI Studio（云端）。本地引擎支持界面内一键下载安装，下载走多镜像轮询。
 - **智能预处理**：小区域（<500×400）自动 2x Catmull-Rom 放大；原生 / Tesseract 引擎自动应用大津法二值化与智能反色，适配深色浅色背景。
-- **问 AI**：把识别结果连同运行时快照（选区、引擎、最近文本）交给 LLM；支持自由提问与多轮对话，工具调用循环兼容 DeepSeek / OpenAI 接口。
-- **设置页**：模型 / API Key / 百度 Token 等全部在界面内直接编辑（gpui-component `Input`），保存即生效。
+- **设置页**：百度 Token 等在界面内直接编辑（gpui-component `Input`），保存即生效。
 - **置顶 + 复制 + 清空**：一键置顶（Win32 `SetWindowPos`），识别结果可复制到剪贴板。
 
 ---
@@ -28,7 +27,7 @@ miaocr/
 ├── crates/tools     「手」：10 个 Agent 工具（复用 vision + 系统原语）
 ├── crates/agent     「脑」：系统提示词组装 + Agent 循环 + 工具注册表
 ├── crates/llm       模型接缝：OpenAI / DeepSeek 兼容 + Mock
-├── crates/ui        界面：gpui-kit 前端（选区 / 轮询 / 设置 / 问 AI）
+├── crates/ui        界面：gpui-kit 前端（选区 / 轮询 / 设置；问 AI UI 暂时下线，后端保留）
 ├── 3rd_party/       内置 MNN（ocr-rs）与 ONNX（oar-ocr）推理引擎
 └── docs/            架构与设计文档
 ```

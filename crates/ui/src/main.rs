@@ -1,4 +1,7 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// 无条件 GUI 子系统：debug 构建也不弹终端。日志与 panic 全走文件
+//（safe_eprint → ~/.miaocr/run.log，panic hook → panic.log），
+// 开发时 tail -f ~/.miaocr/run.log 即可看实时输出。
+#![windows_subsystem = "windows"]
 
 //! 喵OCR / 喵Agent 的 GPUI 前端入口（gpui-kit 0.9）。
 //!
@@ -13,6 +16,8 @@ use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::tag::Tag;
 use gpui_kit::component::theme::ActiveTheme;
+use gpui_kit::component::TitleBar;
+use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::Icon;
 use gpui_kit::*;
@@ -26,7 +31,7 @@ mod ocr_worker;
 #[cfg(target_os = "windows")]
 mod region_picker;
 mod win_top;
-use agent_bridge::{data_dir, AgentConfig, AgentContext, AppSettings};
+use agent_bridge::{data_dir, AppSettings};
 use ocr_worker::{spawn_ocr_worker, BaiduCfg, OcrJob};
 
 const ENGINE_OPTIONS: &[(BackendType, &str)] = &[
@@ -34,7 +39,7 @@ const ENGINE_OPTIONS: &[(BackendType, &str)] = &[
     (BackendType::MacNative, "macOS 原生 (系统自带)"),
     (BackendType::Tesseract, "Tesseract (传统多语言)"),
     (BackendType::OcrRs, "PP-OCRv5 (MNN 内置, 极速)"),
-    (BackendType::OarOcr, "OarOCR (ONNX 内置, 兼容好)"),
+    (BackendType::OarOcr, "PP-OCRv6 (ONNX 内置, 高精)"),
     (BackendType::PaddleOcr, "PaddleOCR-json (外置, 高精)"),
     (BackendType::RapidOcr, "RapidOCR-json (外置, 稳定)"),
     (BackendType::BaiduAiStudio, "百度 AI Studio (云端)"),
@@ -466,30 +471,19 @@ struct AppState {
     jobs: std::sync::mpsc::Sender<OcrJob>,
     /// 实时 OCR 文本。
     text: String,
-    /// 最近一次 AI 解答（与 text 分开显示，避免被轮询覆盖）。
-    answer: String,
     busy: bool,
     /// 选区进行中（防止重复点击）。
     selecting: bool,
     /// 临时状态提示（选区时显示在底栏）。
     status_hint: String,
     backend: BackendType,
-    config: AgentConfig,
     settings: AppSettings,
     /// 设置页里的可编辑输入框。
-    input_api_key: Entity<InputState>,
-    input_model: Entity<InputState>,
-    input_base_url: Entity<InputState>,
     input_baidu_token: Entity<InputState>,
     input_baidu_model: Entity<InputState>,
-    /// 自由提问输入框。
-    input_question: Entity<InputState>,
-    /// 多轮会话历史（只含 user/assistant/tool，不含 system）。
-    chat_history: Vec<llm::ChatMessage>,
     /// 保存/重载后的提示。
     settings_hint: String,
     show_settings: bool,
-    engine_menu_open: bool,
     /// 当前选区。
     region: Option<(i32, i32, u32, u32)>,
     /// 覆盖层刚选完、待 Render 消费并启动轮询的区域。
@@ -660,10 +654,6 @@ impl AppState {
         tlog(&format!("begin_poll: 选区 {region:?}"));
         self.region = Some(region);
         self.paused = false;
-        self.answer.clear();
-        self.chat_history.clear();
-        let question = self.input_question.clone();
-        question.update(cx, |state, cx| state.set_value("", window, cx));
         self.poll_gen = self.poll_gen.wrapping_add(1);
         let gen = self.poll_gen;
         let entity = cx.entity();
@@ -723,16 +713,26 @@ impl AppState {
                         .await
                         .unwrap_or_else(|_| Err(anyhow::anyhow!("OCR 工作线程已退出")));
                     let elapsed = started.elapsed().as_millis();
-                    let next = (elapsed as u64).clamp(120, 1200) + 60;
-                    let _ = cx.update_entity(&entity, |s: &mut AppState, cx| {
-                        s.text = match result {
+                    // 间隔跟随内容活动：变化 → 贴回下限（快速跟进连续变化）；
+                    // 不变 → 每轮放宽 1.5 倍，上限 1260ms，静态内容下省 CPU。
+                    // 下限与 OCR 耗时挂钩（慢引擎不会背靠背满速重识别）。
+                    let next = cx.update_entity(&entity, |s: &mut AppState, cx| {
+                        let new_text = match result {
                             Ok(t) => t,
                             Err(e) => format!("识别失败: {e}"),
                         };
+                        let base = (elapsed as u64).clamp(120, 1200) + 60;
+                        let changed = s.text != new_text;
+                        s.text = new_text;
                         s.busy = false;
                         s.last_ms = Some(elapsed);
-                        s.interval_ms = next;
+                        s.interval_ms = if changed {
+                            base
+                        } else {
+                            (s.interval_ms * 3 / 2).clamp(base, 1260)
+                        };
                         cx.notify();
+                        s.interval_ms
                     });
                     Timer::after(std::time::Duration::from_millis(next)).await;
                 }
@@ -750,9 +750,8 @@ impl AppState {
         if self.paused {
             return "已暂停".to_string();
         }
-        if self.busy {
-            return "识别中…".to_string();
-        }
+        // 轮询期间不再切换「识别中…」文案：busy 只用于防重入，
+        // 状态栏保持稳定，仅每轮结束后更新「上次耗时」。
         let last = match self.last_ms {
             Some(ms) => format!("{ms} ms"),
             None => "—".to_string(),
@@ -772,8 +771,6 @@ impl AppState {
 
     fn clear_output(&mut self, cx: &mut Context<Self>) {
         self.text.clear();
-        self.answer.clear();
-        self.chat_history.clear();
         cx.notify();
     }
 
@@ -795,77 +792,6 @@ impl AppState {
             self.topmost = want;
         }
         cx.notify();
-    }
-
-    /// 把当前 OCR 文本 + 用户问题交给 Agent（工作线程执行，UI 不阻塞）。
-    fn ask_ai(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy {
-            return;
-        }
-        let question = self.input_question.read(cx).value().trim().to_string();
-        let ocr_text = self.text.clone();
-        let has_ocr = !ocr_text.is_empty() && !ocr_text.starts_with("识别失败");
-        // 没有 OCR 文本也允许提问：模型可自行调用 screenshot / ocr_read 观察。
-        if !has_ocr && question.is_empty() {
-            return;
-        }
-
-        // 发送后清空输入框；问题本身已被复制进本次任务。
-        let input = self.input_question.clone();
-        input.update(cx, |state, cx| state.set_value("", window, cx));
-
-        // 让工作线程专注跑 Agent，避免轮询任务插队
-        let was_paused = self.paused;
-        self.paused = true;
-        self.busy = true;
-        self.answer = "正在思考…".to_string();
-
-        let config = self.config.clone();
-        let ctx = AgentContext {
-            region: self.region,
-            backend: self.backend.display_name().to_string(),
-            ocr_text: if has_ocr { ocr_text } else { String::new() },
-        };
-        // 历史用克隆：请求失败时 UI 里的旧会话仍然保留。
-        let history = self.chat_history.clone();
-        let entity = cx.entity();
-        let jobs = self.jobs.clone();
-        cx.notify();
-        window
-            .spawn(cx, async move |cx: &mut AsyncWindowContext| {
-                let (resp_tx, resp_rx) =
-                    smol::channel::bounded::<Result<(String, Vec<llm::ChatMessage>), String>>(1);
-                let sent = jobs
-                    .send(OcrJob::Agent {
-                        ctx,
-                        config,
-                        question,
-                        history,
-                        resp: resp_tx,
-                    })
-                    .is_ok();
-                let result = if sent {
-                    resp_rx
-                        .recv()
-                        .await
-                        .unwrap_or_else(|_| Err("Agent 工作线程已退出".into()))
-                } else {
-                    Err("Agent 工作线程不可用".into())
-                };
-                cx.update_entity(&entity, |state: &mut AppState, cx: &mut Context<AppState>| {
-                    match result {
-                        Ok((answer, history)) => {
-                            state.answer = answer;
-                            state.chat_history = history;
-                        }
-                        Err(e) => state.answer = format!("AI 失败: {e}"),
-                    }
-                    state.busy = false;
-                    state.paused = was_paused;
-                    cx.notify();
-                });
-            })
-            .detach();
     }
 
     fn state_of(&mut self, b: BackendType) -> &mut InstallState {
@@ -989,26 +915,8 @@ impl AppState {
 
     /// 把输入框内容写回配置文件并应用到运行时。
     fn save_settings(&mut self, cx: &mut Context<Self>) {
-        let api_key = self.input_api_key.read(cx).value().to_string();
-        let model = self.input_model.read(cx).value().to_string();
-        let base_url = self.input_base_url.read(cx).value().to_string();
         let baidu_token = self.input_baidu_token.read(cx).value().to_string();
         let baidu_model = self.input_baidu_model.read(cx).value().to_string();
-
-        self.config = AgentConfig {
-            api_key,
-            model: if model.trim().is_empty() {
-                "deepseek-chat".to_string()
-            } else {
-                model
-            },
-            base_url: if base_url.trim().is_empty() {
-                "https://api.deepseek.com".to_string()
-            } else {
-                base_url
-            },
-        };
-        self.config.save();
 
         self.settings.baidu_token = baidu_token;
         self.settings.baidu_model = if baidu_model.trim().is_empty() {
@@ -1019,8 +927,8 @@ impl AppState {
         self.settings.save();
 
         tlog(&format!(
-            "save_settings: model={} base_url={} baidu_model={}",
-            self.config.model, self.config.base_url, self.settings.baidu_model
+            "save_settings: baidu_model={}",
+            self.settings.baidu_model
         ));
         self.settings_hint = "已保存".to_string();
         cx.notify();
@@ -1028,7 +936,6 @@ impl AppState {
 
     /// 从磁盘重载，并同步回输入框。
     fn reload_config(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.config = AgentConfig::load();
         self.settings = AppSettings::load();
         let backend = self
             .settings
@@ -1038,14 +945,7 @@ impl AppState {
             .unwrap_or_else(default_backend);
         self.backend = backend;
         tools::set_current_backend(backend);
-        let cfg = self.config.clone();
         let s = self.settings.clone();
-        self.input_api_key
-            .update(cx, |st, cx| st.set_value(cfg.api_key, window, cx));
-        self.input_model
-            .update(cx, |st, cx| st.set_value(cfg.model, window, cx));
-        self.input_base_url
-            .update(cx, |st, cx| st.set_value(cfg.base_url, window, cx));
         self.input_baidu_token
             .update(cx, |st, cx| st.set_value(s.baidu_token, window, cx));
         self.input_baidu_model
@@ -1065,9 +965,98 @@ impl AppState {
         self.settings.save();
     }
 
+    /// 统一标题栏：整条可拖拽（未消费的点击落到原生 caption 拖拽），
+    /// children 里放交互元素依然能收到点击（GPUI 会先派发 NC 鼠标事件）。
+    /// 右端由 TitleBar 自动接自绘窗口控件（最小化/最大化/关闭），
+    /// 我们的图标按钮就在最小化图标前面。
+    fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let entity = cx.entity();
+        let e_pin = entity.clone();
+        let e_settings = entity.clone();
+        let e_back = entity.clone();
+        let fg = cx.theme().foreground;
+        let muted = cx.theme().muted_foreground;
+        let in_settings = self.show_settings;
+
+        // 左：标题。设置页显示「设置」，主视图显示品牌 + 副标题。
+        let left = if in_settings {
+            div().text_sm().text_color(fg).child("设置")
+        } else {
+            div()
+                .flex()
+                .items_baseline()
+                .gap_2()
+                .child(div().text_sm().text_color(fg).child("喵OCR"))
+                .child(div().text_xs().text_color(muted).child("屏幕智能助手"))
+        };
+
+        // 右：图标按钮，紧贴窗口控件（最小化前）。设置页换成返回箭头。
+        // 注意：按钮外面包一层「防拖拽护罩」——Button 的 mouse_down 不阻断冒泡，
+        // 若任由事件冒到 TitleBar 的 should_move 拖拽逻辑，点击时手只要动 1px
+        // 就会被劫持成拖动窗口，click 永远走不完。
+        let right = if in_settings {
+            titlebar_clickable(
+                Button::new("titlebar-back")
+                    .ghost()
+                    .compact()
+                    .icon(IconName::ArrowLeft)
+                    .tooltip("返回")
+                    .on_click(move |_ev, _w, cx| {
+                        e_back.update(cx, |s: &mut AppState, cx| {
+                            s.show_settings = false;
+                            cx.notify();
+                        });
+                    }),
+            )
+            .into_any_element()
+        } else {
+            let pin_icon = if self.topmost {
+                IconName::PinOff
+            } else {
+                IconName::Pin
+            };
+            titlebar_clickable(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        Button::new("titlebar-pin")
+                            .ghost()
+                            .compact()
+                            .icon(pin_icon)
+                            .tooltip(if self.topmost { "取消置顶" } else { "置顶" })
+                            .on_click(move |_ev, window, cx| {
+                                e_pin.update(
+                                    cx,
+                                    |s: &mut AppState, cx: &mut Context<AppState>| {
+                                        s.toggle_topmost(window, cx);
+                                    },
+                                );
+                            }),
+                    )
+                    .child(
+                        Button::new("titlebar-settings")
+                            .ghost()
+                            .compact()
+                            .icon(IconName::Settings)
+                            .tooltip("设置")
+                            .on_click(move |_ev, _w, cx| {
+                                e_settings.update(cx, |s: &mut AppState, cx| {
+                                    s.show_settings = true;
+                                    cx.notify();
+                                });
+                            }),
+                    ),
+            )
+            .into_any_element()
+        };
+
+        TitleBar::new().child(left).child(right)
+    }
+
     fn render_settings(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let bg = cx.theme().background;
-        let fg = cx.theme().foreground;
         let muted = cx.theme().muted_foreground;
         let success = cx.theme().success;
         let entity = cx.entity();
@@ -1077,33 +1066,10 @@ impl AppState {
             .flex_col()
             .gap_3()
             .p_3()
-            .size_full()
+            .w_full()
+            .flex_1()
+            .min_h_0()
             .bg(bg)
-            // ── 头 ──
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(div().text_lg().text_color(fg).child("设置"))
-                    .child(Button::new("back").outline().label("返回").on_click({
-                        let e = entity.clone();
-                        move |_ev, _w, cx| {
-                            e.update(cx, |s: &mut AppState, cx| {
-                                s.show_settings = false;
-                                cx.notify();
-                            });
-                        }
-                    })),
-            )
-            // ── 模型配置 ──
-            .child(
-                GroupBox::new()
-                    .title("DeepSeek / OpenAI 兼容（问 AI 用）")
-                    .child(Self::field_row("服务地址", &self.input_base_url))
-                    .child(Self::field_row("模型", &self.input_model))
-                    .child(Self::field_row("API Key", &self.input_api_key)),
-            )
             // ── 百度配置 ──
             .child(
                 GroupBox::new()
@@ -1172,10 +1138,7 @@ impl AppState {
                 div()
                     .text_xs()
                     .text_color(muted)
-                    .child(
-                        "API Key 存于 agent_config.json，百度 Token 存于 settings.json；\
-                         保存后立即生效，也可点「重载」从磁盘读回。",
-                    ),
+                    .child("百度 Token 存于 settings.json；保存后立即生效，也可点「重载」从磁盘读回。"),
             )
     }
 
@@ -1203,50 +1166,6 @@ impl AppState {
             .into_any_element()
     }
 
-    fn render_engine_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let current = self.backend;
-        let border = cx.theme().border;
-        let hover = cx.theme().list_hover;
-        let active_bg = cx.theme().list_active;
-        let fg = cx.theme().foreground;
-        let popover = cx.theme().popover;
-
-        div()
-            .flex()
-            .flex_col()
-            .p_1()
-            .bg(popover)
-            .rounded_md()
-            .border_1()
-            .border_color(border)
-            .children(ENGINE_OPTIONS.iter().map(move |(b, label)| {
-                let b = *b;
-                let label = label.to_string();
-                let selected = b == current;
-                div()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .text_sm()
-                    .bg(if selected { active_bg } else { popover })
-                    .text_color(fg)
-                    .hover(move |s| s.bg(hover))
-                    .child(if selected { format!("✓ {label}") } else { label })
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _ev, _w, cx| {
-                            this.backend = b;
-                            tools::set_current_backend(b);
-                            this.settings.selected_backend = Some(b.log_name().to_string());
-                            this.settings.save();
-                            this.engine_menu_open = false;
-                            cx.notify();
-                        }),
-                    )
-            }))
-    }
-
     /// 引擎安装状态的彩色标签。
     fn engine_tag(&self) -> Tag {
         let tag = match self.current_state() {
@@ -1259,145 +1178,103 @@ impl AppState {
         tag.child(self.engine_state_label())
     }
 
-fn render_float(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_float(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let bg = cx.theme().background;
         let fg = cx.theme().foreground;
         let muted = cx.theme().muted_foreground;
-        let primary = cx.theme().primary;
         let border = cx.theme().border;
         let card = cx.theme().group_box;
         let backend_label = self.backend.display_name().to_string();
 
         let entity = cx.entity();
         let e_select = entity.clone();
-        let e_ask = entity.clone();
         let e_clear = entity.clone();
-        let e_pin = entity.clone();
         let e_pause = entity.clone();
         let e_copy = entity.clone();
-        let e_settings = entity.clone();
         let e_install = entity.clone();
 
         let engine_tag = self.engine_tag();
         let show_install = self.current_state() == InstallState::NotInstalled;
         let has_text = !self.text.is_empty();
         let text = self.text.clone();
-        let answer = self.answer.clone();
         let status = self.status_line();
         let paused = self.paused;
-        let topmost = self.topmost;
-
-        let engine_menu = if self.engine_menu_open {
-            self.render_engine_menu(cx).into_any_element()
-        } else {
-            div().into_any_element()
-        };
+        let current = self.backend;
 
         div()
             .flex()
             .flex_col()
             .gap_3()
             .p_3()
-            .size_full()
+            .w_full()
+            .flex_1()
+            .min_h_0()
             .bg(bg)
-            // ── 头 ──
+            // ── 引擎 ──
             .child(
                 div()
                     .flex()
                     .items_center()
                     .justify_between()
                     .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .child(div().text_lg().text_color(fg).child("喵OCR"))
-                            .child(div().text_xs().text_color(muted).child("屏幕智能助手")),
+                        Button::new("engine-picker")
+                            .outline()
+                            .icon(IconName::ScanText)
+                            .label(format!("{backend_label}  ▾"))
+                            // 下拉菜单走 Popover 浮层（默认 TopLeft 锚 =
+                            // 在按钮下方展开、左对齐；anchor 命名的是浮层
+                            // 自己的角，传 BottomLeft 会向上展开顶出窗口）：
+                            // 不占布局空间，点击外部自动收起，选中项带勾选态。
+                            .dropdown_menu(move |menu, _window, _cx| {
+                                let mut menu = menu;
+                                for (b, label) in ENGINE_OPTIONS {
+                                    let b = *b;
+                                    let e = entity.clone();
+                                    menu = menu.item(
+                                        PopupMenuItem::new(*label)
+                                            .checked(b == current)
+                                            .on_click(move |_ev, _w, cx| {
+                                                e.update(
+                                                    cx,
+                                                    |s: &mut AppState, cx| {
+                                                        s.backend = b;
+                                                        tools::set_current_backend(b);
+                                                        s.settings.selected_backend =
+                                                            Some(b.log_name().to_string());
+                                                        s.settings.save();
+                                                        cx.notify();
+                                                    },
+                                                );
+                                            }),
+                                    );
+                                }
+                                menu
+                            }),
                     )
                     .child(
                         div()
                             .flex()
                             .items_center()
-                            .gap_1()
-                            .child(
-                                Button::new("pin")
-                                    .ghost()
-                                    .icon(IconName::Pin)
-                                    .label(if topmost { "已置顶" } else { "置顶" })
-                                    .on_click({
-                                        let e = e_pin;
-                                        move |_ev, window, cx| {
-                                            e.update(
-                                                cx,
-                                                |s: &mut AppState, cx: &mut Context<AppState>| {
-                                                    s.toggle_topmost(window, cx);
-                                                },
-                                            );
-                                        }
-                                    }),
-                            )
-                            .child(
-                                Button::new("settings")
-                                    .ghost()
-                                    .icon(IconName::Settings)
-                                    .label("设置")
-                                    .on_click({
-                                        let e = e_settings;
-                                        move |_ev, _w, cx| {
-                                            e.update(
-                                                cx,
-                                                |s: &mut AppState, cx: &mut Context<AppState>| {
-                                                    s.show_settings = true;
-                                                    cx.notify();
-                                                },
-                                            );
-                                        }
-                                    }),
-                            ),
+                            .gap_2()
+                            .child(engine_tag)
+                            .child(if show_install {
+                                Button::new("install").primary().label("安装").on_click({
+                                    let e = e_install;
+                                    move |_ev, window, cx| {
+                                        e.update(
+                                            cx,
+                                            |s: &mut AppState, cx: &mut Context<AppState>| {
+                                                s.install_backend(window, cx);
+                                            },
+                                        );
+                                    }
+                                })
+                                .into_any_element()
+                            } else {
+                                div().into_any_element()
+                            }),
                     ),
             )
-            // ── 引擎 ──
-            .child(
-                GroupBox::new().title("识别引擎").child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .child(
-                            Button::new("engine-picker")
-                                .outline()
-                                .icon(IconName::ScanText)
-                                .label(format!("{backend_label}  ▾"))
-                                .on_click(cx.listener(|this, _ev, _w, cx| {
-                                    this.engine_menu_open = !this.engine_menu_open;
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(engine_tag)
-                                .child(if show_install {
-                                    Button::new("install").primary().label("安装").on_click({
-                                        let e = e_install;
-                                        move |_ev, window, cx| {
-                                            e.update(
-                                                cx,
-                                                |s: &mut AppState, cx: &mut Context<AppState>| {
-                                                    s.install_backend(window, cx);
-                                                },
-                                            );
-                                        }
-                                    })
-                                    .into_any_element()
-                                } else {
-                                    div().into_any_element()
-                                }),
-                        ),
-                ),
-            )
-            .child(engine_menu)
             // ── 操作 ──
             .child(
                 div()
@@ -1416,24 +1293,6 @@ fn render_float(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
                                         cx,
                                         |s: &mut AppState, cx: &mut Context<AppState>| {
                                             s.start_select(window, cx);
-                                        },
-                                    );
-                                }
-                            }),
-                    )
-                    .child(
-                        Button::new("ask")
-                            .outline()
-                            .icon(IconName::Sparkles)
-                            .label("问 AI")
-                            .flex_1()
-                            .on_click({
-                                let e = e_ask;
-                                move |_ev, window, cx| {
-                                    e.update(
-                                        cx,
-                                        |s: &mut AppState, cx: &mut Context<AppState>| {
-                                            s.ask_ai(window, cx);
                                         },
                                     );
                                 }
@@ -1469,20 +1328,6 @@ fn render_float(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
                                     .overflow_y_scrollbar()
                                     .child(text),
                             )
-                            .child(if answer.is_empty() {
-                                div().into_any_element()
-                            } else {
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_1()
-                                    .pt_2()
-                                    .border_t_1()
-                                    .border_color(border)
-                                    .child(div().text_xs().text_color(primary).child("AI 解答"))
-                                    .child(div().text_sm().text_color(fg).child(answer))
-                                    .into_any_element()
-                            })
                             .into_any_element()
                     } else {
                         Empty::new()
@@ -1493,37 +1338,11 @@ fn render_float(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
                                     .title(EmptyTitle::new().child("暂无识别内容"))
                                     .description(
                                         EmptyDescription::new()
-                                            .child("点击「选区」框选屏幕；识别后可在下方直接提问"),
+                                            .child("点击「选区」框选屏幕，识别文字会显示在这里"),
                                     ),
                             )
                             .into_any_element()
-                    })
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .pt_2()
-                            .border_t_1()
-                            .border_color(border)
-                            .child(div().flex_1().child(Input::new(&self.input_question)))
-                            .child(
-                                Button::new("send-question")
-                                    .primary()
-                                    .label("发送")
-                                    .on_click({
-                                        let e = entity.clone();
-                                        move |_ev, window, cx| {
-                                            e.update(
-                                                cx,
-                                                |s: &mut AppState, cx: &mut Context<AppState>| {
-                                                    s.ask_ai(window, cx);
-                                                },
-                                            );
-                                        }
-                                    }),
-                            ),
-                    ),
+                    }),
             )
             // ── 底栏 ──
             .child(
@@ -1593,6 +1412,20 @@ fn render_float(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
     }
 }
 
+/// 标题栏内可点击元素的「防拖拽护罩」：在冒泡到 TitleBar 的拖拽逻辑
+/// （should_move → start_window_move）之前吃掉鼠标按下事件，保证 click
+/// 能走完。Button 自身不阻断冒泡，所以这层护罩必不可少。
+fn titlebar_clickable(child: impl IntoElement) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .on_mouse_down(MouseButton::Left, |_, window, cx| {
+            window.prevent_default();
+            cx.stop_propagation();
+        })
+        .child(child)
+}
+
 impl Render for AppState {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 覆盖层选完区后由 start_select 的等待任务写入，这里启动常驻轮询
@@ -1601,11 +1434,19 @@ impl Render for AppState {
             self.begin_poll(region, window, cx);
         }
         self.ensure_backend(window, cx);
-        if self.show_settings {
+        // 统一标题栏：主视图与设置视图共用，右端自动接窗口控件（最小化/最大化/关闭）。
+        let content = if self.show_settings {
             self.render_settings(cx).into_any_element()
         } else {
             self.render_float(cx).into_any_element()
-        }
+        };
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(cx.theme().background)
+            .child(self.render_title_bar(cx))
+            .child(content)
     }
 }
 
@@ -1797,34 +1638,19 @@ fn main() {
             .unwrap_or_else(default_backend);
         tools::set_current_backend(backend);
         gpui_kit::open_window(
+            // TitleBar::window_options：隐藏原生标题栏、由组件自绘
+            //（拖拽 / 双击 / 窗口控件全走 GPUI 的命中测试，行为原生）。
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                     None,
                     size(px(520.0), px(620.0)),
                     cx,
                 ))),
-                ..Default::default()
+                ..TitleBar::window_options()
             },
             cx,
             move |window, cx| {
                 window.set_window_title("喵OCR");
-                let config = AgentConfig::load();
-                let input_api_key = cx.new(|cx| {
-                    InputState::new(window, cx)
-                        .masked(true)
-                        .placeholder("sk-…")
-                        .default_value(config.api_key.clone())
-                });
-                let input_model = cx.new(|cx| {
-                    InputState::new(window, cx)
-                        .placeholder("deepseek-chat")
-                        .default_value(config.model.clone())
-                });
-                let input_base_url = cx.new(|cx| {
-                    InputState::new(window, cx)
-                        .placeholder("https://api.deepseek.com")
-                        .default_value(config.base_url.clone())
-                });
                 let input_baidu_token = cx.new(|cx| {
                     InputState::new(window, cx)
                         .masked(true)
@@ -1836,29 +1662,18 @@ fn main() {
                         .placeholder("PaddleOCR-VL-1.6")
                         .default_value(settings.baidu_model.clone())
                 });
-                let input_question = cx.new(|cx| {
-                    InputState::new(window, cx).placeholder("针对识别内容提问，点「发送」…")
-                });
                 cx.new(|_| AppState {
                     jobs: jobs.clone(),
                     text: String::new(),
-                    answer: String::new(),
                     busy: false,
                     selecting: false,
                     status_hint: String::new(),
                     backend,
-                    config,
                     settings,
-                    input_api_key,
-                    input_model,
-                    input_base_url,
                     input_baidu_token,
                     input_baidu_model,
-                    input_question,
-                    chat_history: Vec::new(),
                     settings_hint: String::new(),
                     show_settings: start_in_settings,
-                    engine_menu_open: false,
                     region: None,
                     pending_region: None,
                     poll_gen: 0,

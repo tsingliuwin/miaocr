@@ -18,7 +18,7 @@ miaocr/                    (workspace root，虚拟 manifest，无根包)
 ├── crates/agent           脑：系统提示词组装 + Agent 循环 + 工具注册表/守卫
 │   └── src/{lib,agent_loop,tool}.rs
 ├── crates/llm             模型接缝：OpenAI/DeepSeek 兼容 + function calling + Mock
-├── crates/ui              界面：gpui-kit 悬浮窗 + 选区 + 引擎 + 设置 + 问 AI（全异步）
+├── crates/ui              界面：gpui-kit 悬浮窗 + 选区 + 引擎 + 设置（全异步；问 AI UI 已下线待恢复）
 │   └── src/{main,agent_bridge,ocr_worker,region_picker,win_top,mac_perm}.rs
 ├── 3rd_party/{ocr-rs,oar-ocr}   内置 MNN / ONNX 推理引擎
 ├── docs/                  方案 + 系统提示词 + 本文件
@@ -51,12 +51,10 @@ miaocr/                    (workspace root，虚拟 manifest，无根包)
   → 松开 → 虚拟桌面物理坐标 → vision::ocr_region(区域, 引擎)
   → OCR 文本回显（异步 window.spawn + update_entity）
 
-「问 AI」
-  → 输入框取用户问题（空问题则默认「简要说明这段内容」）
-  → agent::SystemPrompt 组装（identity/persona + 10 工具的指导 section + schema）
-  → Agent::run_turn（system + 会话历史 + 运行时快照 + 新问题）→ LLM
-  → 若 LLM 请求工具 → ToolRegistry::execute（含 catch_unwind 守卫）→ 结果回传
-  → 多轮直到最终解答 → 回显；历史随回答返回并由 UI 持有，供下一问继续
+「问 AI」——UI 已暂时下线（2026-11），后端链路整体保留在
+  crates/{agent, llm, tools} 与 ui/agent_bridge.rs（标记 allow(dead_code)），
+  恢复时只需在 ocr_worker 加回 Agent 任务并在 UI 恢复输入框：
+  agent::SystemPrompt 组装 → Agent::run_turn → LLM → 工具循环 → 多轮解答
 ```
 
 选区交互细节（Windows，`crates/ui/src/region_picker.rs`，Snipaste / 系统截图风格）：
@@ -121,25 +119,23 @@ cargo run -p miaocr-ui
 3. **`TMP`/`TEMP` 指向工作区**：受限进程环境里 build-script 子进程对系统 TEMP
    无写权限，会表现为 `D8050` / `nmake: U1054`。`scripts/build.ps1` 已处理。
 
-「问 AI」需先在 `~/.miaocr/agent_config.json` 填 DeepSeek API Key（`api_key`/`model`/`base_url`），或直接在界面「⚙ 设置」里填入并点「保存」。
 百度 AI Studio 的 token/模型/三个识别开关存在 `~/.miaocr/settings.json`，同样可在「⚙ 设置」页直接编辑。
 
 ## 7. 状态与剩余
 
 | 项 | 状态 |
 |---|---|
-| vision（8 引擎 + 检测 + 安装）| ✅ |
+| vision（8 引擎 + 检测 + 安装；OarOCR 通道已升级 PP-OCRv6 small，v5 自动回落）| ✅ |
 | agent（提示词组装 + 循环 + 工具调用 + 真实参数 schema）| ✅ |
-| ui（选区 + 持续轮询 + 暂停/复制/清空 + 置顶 + 引擎 + 设置 + 问 AI）| ✅ |
+| ui（选区 + 持续轮询 + 暂停/复制/清空 + 置顶 + 引擎 + 设置）| ✅ |
 | 设置页（component 0.9 `Input` 输入框 + 内联保存/重载）| ✅ |
 | gpui-kit 0.9 迁移（gpui-pre 0.3.11 + component 0.9）| ✅ |
 | 单元测试（agent 20 + tools 5 + ui 4，0 失败）| ✅ |
-| 真实 DeepSeek 端到端验证 | ⏳ 需 API Key |
+| 问 AI UI | ⏸ 暂时下线（2026-11），后端与 agent_config.json 保留 |
 | 百度云端 OCR 真机调用 | ⏳ 需消耗额度，仅验证参数透传 |
 | gpui-component 现成组件（GroupBox/Checkbox/Tag/Empty/Input/Icon/Scroll）| ✅ 已替换手写 div |
 | egui 旧入口 / poc / 旧权限文档清理 | ✅ 已移除 |
 | shell 工具 | ✅ 已实现，默认不注册（`build_default_tools_with_shell` 显式 opt-in）|
 | Windows 原生选区 | ✅ 截图覆盖层 + 压暗遮罩 + 十字线 + 放大镜 + 尺寸徽标，纯 GDI 脏区重绘，支持多屏/跨屏 |
 | macOS 选区 | ⏳ 仍用旧截图覆盖层，待迁移为原生边框选区 |
-| 「问 AI」自由提问 + 多轮会话 | ✅ 历史由 UI 持有，重新选区/清空时重置；超过 40 条按整轮裁剪 |
 | `ocr_read` 默认引擎 | ✅ 未显式指定时使用 UI 当前引擎（`tools::set_current_backend` 同步）|

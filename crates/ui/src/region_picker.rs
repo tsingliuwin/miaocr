@@ -358,7 +358,11 @@ impl Overlay {
         }
     }
 
-    /// 放大镜整体矩形（含标签与边框余量）；拖拽中不显示。
+    /// 放大镜整体矩形；拖拽中不显示。
+    ///
+    /// 这是**完整绘制范围**（内容 + 2px 外框笔 + 标签 + 余量），失效也按它来——
+    /// 若失效范围比实际画出来的小，边框笔越界的像素不会被擦除，移动时就会
+    /// 留下拖尾。绘制侧用 `left + 2 / top + 2` 内缩出内容原点。
     unsafe fn mag_rect(&self) -> Option<RECT> {
         if self.anchor.is_some() {
             return None;
@@ -367,7 +371,7 @@ impl Overlay {
         let (vw, vh) = (self.vw, self.vh);
         // 优先放在光标右下，靠边翻到对侧，最后整体夹回屏内。
         let w = MAG_BOX + 4;
-        let h = MAG_TOTAL_H + 2;
+        let h = MAG_TOTAL_H + 4;
         let mut mx = cx + 20;
         let mut my = cy + 20;
         if mx + w > vw {
@@ -552,8 +556,9 @@ impl Overlay {
     /// 放大镜：光标附近 15×15 像素放大 8 倍 + 网格 + 中心像素高亮 + 坐标/颜色。
     unsafe fn draw_magnifier(&mut self, f: HDC) {
         let Some(box_r) = self.mag_rect() else { return };
-        let mx = box_r.left + 1;
-        let my = box_r.top + 1;
+        // 内容原点 = 完整范围向内缩 2px（给 2px 外框笔留位，见 mag_rect 注释）。
+        let mx = box_r.left + 2;
+        let my = box_r.top + 2;
         let (cx, cy) = self.cursor;
 
         // 采样窗口以光标为中心，夹在 DIB 内（贴边时视野向内滑）。

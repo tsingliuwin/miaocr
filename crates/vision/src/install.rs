@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::detect::{
     detect_oar_ocr, detect_ocr_rs, detect_paddle, detect_rapid, detect_tesseract,
+    download_file_from_urls,
     download_file_with_mirrors,
 };
 use crate::{data_dir, log, repaint, InstallState};
@@ -183,9 +184,9 @@ pub fn start_oar_ocr_install(state: Arc<Mutex<InstallState>>) {
         };
 
         let models_dir = data_dir().join("models");
-        let det_path = models_dir.join("ppocrv5_mobile_det.onnx");
-        let rec_path = models_dir.join("ppocrv5_mobile_rec.onnx");
-        let keys_path = models_dir.join("ppocrv5_dict.txt");
+        let det_path = models_dir.join("ppocrv6_small_det.onnx");
+        let rec_path = models_dir.join("ppocrv6_small_rec.onnx");
+        let keys_path = models_dir.join("ppocrv6_dict.txt");
 
         let set_msg = |msg: String| {
             set(InstallState::Installing(msg));
@@ -195,50 +196,56 @@ pub fn start_oar_ocr_install(state: Arc<Mutex<InstallState>>) {
             path.metadata().map(|m| m.len() >= min_size).unwrap_or(false)
         };
 
-        if !is_valid(&det_path, 1024 * 1024) {
-            let _ = std::fs::remove_file(&det_path);
-            if let Err(e) = download_file_with_mirrors(
-                &det_path,
-                "GreatV/oar-ocr/releases/download/v0.1.0/ppocrv5_mobile_det.onnx",
-                "检测模型 (约 4.8 MB)",
-                &set_msg,
-            ) {
-                let _ = std::fs::remove_file(&det_path);
+        // PP-OCRv6 small 档（ONNX）来自 ModelScope 的 oar-ocr 官方模型仓库。
+        // 必须钉住 commit 下载：master 分支的 LFS 引用解析会返回 HTTP 200 +
+        // JSON 错误（"文件内容为空"），curl -f 拦不住，所以下载后还要按
+        // 最小体积校验兜底。
+        let files: [(std::path::PathBuf, u64, Vec<String>, &str); 3] = [
+            (
+                det_path,
+                5 * 1024 * 1024,
+                vec![String::from(
+                    "https://www.modelscope.cn/models/greatv/oar-ocr/resolve/3f286c18c934050784bdf25dae4ccf55d197208d/pp-ocrv6_small_det.onnx",
+                )],
+                "PP-OCRv6 检测模型 (约 9.9 MB)",
+            ),
+            (
+                rec_path,
+                15 * 1024 * 1024,
+                vec![String::from(
+                    "https://www.modelscope.cn/models/greatv/oar-ocr/resolve/1684bdef2329ac08227939501a49d91c9cc0d24a/pp-ocrv6_small_rec.onnx",
+                )],
+                "PP-OCRv6 识别模型 (约 21 MB)",
+            ),
+            (
+                keys_path,
+                50 * 1024,
+                vec![String::from(
+                    "https://www.modelscope.cn/models/greatv/oar-ocr/resolve/f5adaf9b173ce1ac489cdf07fc9f001082f4371b/ppocrv6_dict.txt",
+                )],
+                "PP-OCRv6 字符集 (约 75 KB)",
+            ),
+        ];
+
+        for (path, min_size, urls, label) in &files {
+            if is_valid(path, *min_size) {
+                continue;
+            }
+            let _ = std::fs::remove_file(path);
+            if let Err(e) = download_file_from_urls(path, urls, label, &set_msg) {
+                let _ = std::fs::remove_file(path);
                 set(InstallState::Failed(e.to_string()));
                 return;
             }
-        }
-
-        if !is_valid(&rec_path, 5 * 1024 * 1024) {
-            let _ = std::fs::remove_file(&rec_path);
-            if let Err(e) = download_file_with_mirrors(
-                &rec_path,
-                "GreatV/oar-ocr/releases/download/v0.1.0/ppocrv5_mobile_rec.onnx",
-                "识别模型 (约 16.5 MB)",
-                &set_msg,
-            ) {
-                let _ = std::fs::remove_file(&rec_path);
-                set(InstallState::Failed(e.to_string()));
-                return;
-            }
-        }
-
-        if !is_valid(&keys_path, 10 * 1024) {
-            let _ = std::fs::remove_file(&keys_path);
-            if let Err(e) = download_file_with_mirrors(
-                &keys_path,
-                "GreatV/oar-ocr/releases/download/v0.1.0/ppocrv5_dict.txt",
-                "字符集 (约 1.2 MB)",
-                &set_msg,
-            ) {
-                let _ = std::fs::remove_file(&keys_path);
-                set(InstallState::Failed(e.to_string()));
+            if !is_valid(path, *min_size) {
+                let _ = std::fs::remove_file(path);
+                set(InstallState::Failed(format!("{label} 下载不完整（体积校验未通过）")));
                 return;
             }
         }
 
         if detect_oar_ocr() {
-            log("[INSTALL] oar-ocr 模型下载及安装完成");
+            log("[INSTALL] PP-OCRv6 (oar-ocr) 模型下载及安装完成");
             set(InstallState::Available);
         } else {
             set(InstallState::Failed("模型下载已完成，但检测失败，请重试".to_string()));

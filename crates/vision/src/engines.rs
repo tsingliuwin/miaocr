@@ -359,9 +359,28 @@ pub fn ocr_oar_ocr(bgra: &[u8], width: u32, height: u32) -> Result<String> {
                 return None;
             }
             let models_dir = data_dir().join("models");
-            let det_path = models_dir.join("ppocrv5_mobile_det.onnx");
-            let rec_path = models_dir.join("ppocrv5_mobile_rec.onnx");
-            let keys_path = models_dir.join("ppocrv5_dict.txt");
+            // PP-OCRv6（ONNX，small 档）优先；老安装只有 v5 文件时回落 v5。
+            // 检测后处理参数随模型版本切换：v6 官方 DB 默认
+            //（score 0.2 / box 0.45 / unclip 1.4，oar-ocr 0.10 预设同款），
+            // v5 沿用旧值（0.3 / 0.6 / 1.5）。
+            let v6 = (
+                models_dir.join("ppocrv6_small_det.onnx"),
+                models_dir.join("ppocrv6_small_rec.onnx"),
+                models_dir.join("ppocrv6_dict.txt"),
+            );
+            let use_v6 = v6.0.exists() && v6.1.exists() && v6.2.exists();
+            let (det_path, rec_path, keys_path, (th, box_th, unclip)) = if use_v6 {
+                log("[OAR-OCR] 使用 PP-OCRv6 small (ONNX)");
+                (v6.0, v6.1, v6.2, (0.2, 0.45, 1.4))
+            } else {
+                log("[OAR-OCR] 使用 PP-OCRv5 mobile (ONNX)");
+                (
+                    models_dir.join("ppocrv5_mobile_det.onnx"),
+                    models_dir.join("ppocrv5_mobile_rec.onnx"),
+                    models_dir.join("ppocrv5_dict.txt"),
+                    (0.3, 0.6, 1.5),
+                )
+            };
 
             match oar_ocr::pipeline::OAROCRBuilder::new(
                 det_path.to_string_lossy().to_string(),
@@ -370,9 +389,9 @@ pub fn ocr_oar_ocr(bgra: &[u8], width: u32, height: u32) -> Result<String> {
             )
             .text_detection_batch_size(1)
             .text_recognition_batch_size(1)
-            .text_det_threshold(0.3)
-            .text_det_box_threshold(0.6)
-            .text_det_unclip_ratio(1.5)
+            .text_det_threshold(th)
+            .text_det_box_threshold(box_th)
+            .text_det_unclip_ratio(unclip)
             .text_det_max_side_limit(4000)
             .text_rec_score_threshold(0.0)
             .text_rec_input_shape((3, 48, 320))

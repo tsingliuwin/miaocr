@@ -56,7 +56,7 @@ impl BackendType {
             BackendType::RapidOcr => "RapidOCR-json",
             BackendType::BaiduAiStudio => "百度 AI Studio",
             BackendType::OcrRs => "PP-OCRv5 (MNN)",
-            BackendType::OarOcr => "OarOCR (ONNX)",
+            BackendType::OarOcr => "PP-OCRv6 (ONNX)",
         }
     }
 

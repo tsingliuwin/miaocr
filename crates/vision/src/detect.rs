@@ -147,15 +147,18 @@ pub fn detect_ocr_rs() -> bool {
 /// 检测本地 oar-ocr 模型文件是否齐全且大小正确
 pub fn detect_oar_ocr() -> bool {
     let models_dir = data_dir().join("models");
-    let det = models_dir.join("ppocrv5_mobile_det.onnx");
-    let rec = models_dir.join("ppocrv5_mobile_rec.onnx");
-    let keys = models_dir.join("ppocrv5_dict.txt");
-
     let is_valid = |path: &Path, min_size: u64| {
         path.metadata().map(|m| m.len() >= min_size).unwrap_or(false)
     };
 
-    is_valid(&det, 1024 * 1024) && is_valid(&rec, 5 * 1024 * 1024) && is_valid(&keys, 10 * 1024)
+    // PP-OCRv6（新装默认）或 PP-OCRv5（老安装回落）任一齐套即可。
+    let v6_ok = is_valid(&models_dir.join("ppocrv6_small_det.onnx"), 5 * 1024 * 1024)
+        && is_valid(&models_dir.join("ppocrv6_small_rec.onnx"), 15 * 1024 * 1024)
+        && is_valid(&models_dir.join("ppocrv6_dict.txt"), 50 * 1024);
+    let v5_ok = is_valid(&models_dir.join("ppocrv5_mobile_det.onnx"), 1024 * 1024)
+        && is_valid(&models_dir.join("ppocrv5_mobile_rec.onnx"), 5 * 1024 * 1024)
+        && is_valid(&models_dir.join("ppocrv5_dict.txt"), 10 * 1024);
+    v6_ok || v5_ok
 }
 
 /// 多镜像源轮询下载文件（Gitee/ghproxy/GitHub 直连）。
@@ -173,6 +176,20 @@ pub fn download_file_with_mirrors(
         format!("https://ghproxy.net/https://github.com/{}", github_raw_path),
         format!("https://github.com/{}", github_raw_path),
     ];
+    download_file_from_urls(dest_path, &urls, label, set_state)
+}
+
+/// 按给定绝对 URL 列表轮询下载（ModelScope 等非 GitHub 源用这个）。
+///
+/// 注意：ModelScope 对 LFS 文件走 `resolve/master/` 会返回 HTTP 200 +
+/// JSON 错误（"文件内容为空"），必须钉住文件所在 commit；调用方下载后
+/// 还应做大小校验（curl -f 拦不住 200 的错误页）。
+pub fn download_file_from_urls(
+    dest_path: &Path,
+    urls: &[String],
+    label: &str,
+    set_state: &dyn Fn(String),
+) -> Result<()> {
     let mut last_error_msg = String::new();
     for (idx, url) in urls.iter().enumerate() {
         set_state(format!("正在下载 {} (源 {}/{})...", label, idx + 1, urls.len()));

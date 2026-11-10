@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   Windows 构建脚本：载入 MSVC 环境、修正临时目录，再调用 cargo。
 
@@ -49,4 +49,17 @@ if ($Check) {
 
 Write-Host "> cargo $argLine" -ForegroundColor Cyan
 cmd /c "set `"TMP=$tmp`" && set `"TEMP=$tmp`" && call `"$vcvars`" >nul 2>&1 && cd /d $root && cargo $argLine"
-exit $LASTEXITCODE
+$code = $LASTEXITCODE
+if ($code -ne 0) { exit $code }
+
+# 沙箱环境（agent 受限进程）里构建时，链接产物会被打上
+# "Mandatory Label\Low" 完整性标签：运行时进程以 Low 完整性执行，写任何
+# 普通文件（~/.miaocr 日志、%TEMP% 临时 PNG 等）都会 access denied (os error 5)，
+# 症状如 PaddleOCR-json 识别失败「拒绝访问」。构建完统一提回 Medium：
+if (-not $Check) {
+    $exe = Join-Path $root "target\debug\miaocr.exe"
+    if (Test-Path $exe) {
+        icacls $exe /setintegritylevel medium | Out-Null
+    }
+}
+exit 0

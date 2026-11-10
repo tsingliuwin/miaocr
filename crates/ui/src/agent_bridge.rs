@@ -1,4 +1,9 @@
 //! Agent 桥接：组装 miaocr 系统提示词并调用 LLM，把「眼睛」与「大脑」接起来。
+//!
+//! 「问 AI」UI 已暂时下线（2026-11），本模块整体保留待恢复：
+//! 数据结构与 ~/.miaocr/agent_config.json 的读写不变，重新接线时
+//! 只需在 ocr_worker 恢复 Agent 任务并在 UI 加回输入框即可。
+#![allow(dead_code)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
