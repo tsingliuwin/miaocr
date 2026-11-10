@@ -1,0 +1,68 @@
+# 发版工作流：推 v* tag 自动在 GitHub Actions 上构建 Windows 版并创建 Release。
+#
+# 仓库是 CI 自包含的：
+# - ocr-rs（路径依赖）开了 build-mnn-from-source，其 build.rs 在没有本地
+#   MNN 源码时会自动从 GitHub 克隆 alibaba/MNN 3.4.1 源码编译（静态链接，
+#   单 exe 产物）；
+# - onnxruntime 二进制由 ort 的 download-binaries 默认特性自动下载；
+# - Cargo.lock 已入库，依赖版本可复现。
+#
+# 发布说明从 docs/release-notes/<tag>.md 读取，没有时退化为 tag 名。
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 cargo 构建产物
+        uses: Swatinem/rust-cache@v2
+
+      - name: 配置 MSVC 环境（bindgen / link 需要）
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: 构建 release
+        run: cargo build --release --locked -p miaocr-ui
+
+      - name: 打包
+        shell: pwsh
+        run: |
+          $dist = "dist"
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          Copy-Item target\release\miaocr.exe $dist\
+          # MNN 静态链接时是单文件；若未来切动态链接，MNN.dll 会一并带上
+          if (Test-Path target\release\MNN.dll) {
+            Copy-Item target\release\MNN.dll $dist\
+          }
+          Get-ChildItem $dist
+
+      - name: 准备发布说明
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          f="docs/release-notes/${GITHUB_REF_NAME}.md"
+          if [ -f "$f" ]; then
+            cp "$f" body.md
+          else
+            echo "喵OCR ${GITHUB_REF_NAME}" > body.md
+          fi
+
+      - name: 创建 Release 并上传产物
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/miaocr.exe
+          body_path: body.md
